@@ -189,5 +189,25 @@ namespace PokerBot2UnitTests
                 Assert.That(result.Item1, Is.EqualTo(expectedOrdering));
             });
         }
+
+        [Test]
+        // A high-card hand should fall back to the packed five-card ordering when no stronger hand exists.
+        public void EvalHand_ShouldReturnHighestFlush_WhenHandContainsAllSameSuit()
+        {
+            var result = Game.EvalHand(Cards("A♠", "K♠", "Q♠", "9♠", "7♠", "5♠", "3♠"), 0);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(result.Item2, Is.EqualTo(WinHandType.HIGH_CARD));
+                // High-card ordering packs the five highest ranks into 6-bit slots.
+                var firstRank = Game.GetRank(Game.StringToCard("A♠"));
+                var secondRank = Game.GetRank(Game.StringToCard("K♠"));
+                var thirdRank = Game.GetRank(Game.StringToCard("Q♠"));
+                var fourthRank = Game.GetRank(Game.StringToCard("9♠"));
+                var fifthRank = Game.GetRank(Game.StringToCard("7♠"));
+                var expectedOrdering = (firstRank << 24) + (secondRank << 18) + (thirdRank << 12) + (fourthRank << 6) + fifthRank;
+                Assert.That(result.Item1, Is.EqualTo(expectedOrdering));
+            });
+        }
     }
 }
