@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="../PokerBot2UnitTests/PokerBot2UnitTests.csproj" Id="80026198-b67c-4a58-bc39-6c430f62bc43" />
+  <Project Path="PokerBot2.csproj" />
+</Solution>
