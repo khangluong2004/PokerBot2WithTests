@@ -110,7 +110,7 @@ namespace PokerBot2
         }
 
         // input = 7 cards (if not enough, add negative filler cards, all -4,
-        // avoid confusion with 2)
+        // avoid confusion with 2). MUST have at least 1 non-filler.
         // Return (ordering value, win hand type), where the ordering value
         // is used to sort the win hand of the same type (higher = better, equal = same hand)
         // Note: input will be sort in place
@@ -195,7 +195,7 @@ namespace PokerBot2
                     countStraightFlush[prevSuit] = 2;
                     // highestSoFar already sets when init
                 }
-                if (GetRank(noFillerCards[1]) == 0)
+                if (noFillerCards.Length >= 2 && GetRank(noFillerCards[1]) == 0)
                 {
                     var suit = GetSuit(noFillerCards[1]);
                     if (hasAceSuit[suit])
@@ -204,7 +204,7 @@ namespace PokerBot2
                         highestSoFarInStraightFlush[suit] = 0;
                     }
 
-                    if (GetRank(noFillerCards[2]) == 0)
+                    if (noFillerCards.Length >= 3 && GetRank(noFillerCards[2]) == 0)
                     {
                         suit = GetSuit(noFillerCards[2]);
                         if (hasAceSuit[suit])
@@ -213,7 +213,7 @@ namespace PokerBot2
                             highestSoFarInStraightFlush[suit] = 0;
                         }
 
-                        if (GetRank(noFillerCards[3]) == 0)
+                        if (noFillerCards.Length >= 4 && GetRank(noFillerCards[3]) == 0)
                         {
                             suit = GetSuit(noFillerCards[3]);
                             if (hasAceSuit[suit])
@@ -258,8 +258,8 @@ namespace PokerBot2
                 highestSoFarInStraightFlush[curSuit] = curRank;
 
                 // Flush
+                orderingValueFlush[curSuit] += curRank << (6 * flushCount[curSuit]);
                 flushCount[curSuit] += 1;
-                orderingValueFlush[curSuit] += curRank << (6 * (flushCount[curSuit] - 1));
 
                 // Straight
                 rankDiff = curRank - prevRank;
@@ -365,7 +365,7 @@ namespace PokerBot2
                     orderingValueFlushInt = (int)curOrderingValueFlush;
                 }
 
-                if (curOrderingValueFlush > maxFlush)
+                if (orderingValueFlushInt > maxFlush)
                 {
                     maxFlush = orderingValueFlushInt;
                 }
@@ -387,7 +387,7 @@ namespace PokerBot2
                     orderingValueFlushInt = (int)curOrderingValueFlush;
                 }
 
-                if (curOrderingValueFlush > maxFlush)
+                if (orderingValueFlushInt > maxFlush)
                 {
                     maxFlush = orderingValueFlushInt;
                 }
@@ -409,7 +409,7 @@ namespace PokerBot2
                     orderingValueFlushInt = (int)curOrderingValueFlush;
                 }
 
-                if (curOrderingValueFlush > maxFlush)
+                if (orderingValueFlushInt > maxFlush)
                 {
                     maxFlush = orderingValueFlushInt;
                 }
@@ -431,7 +431,7 @@ namespace PokerBot2
                     orderingValueFlushInt = (int)curOrderingValueFlush;
                 }
 
-                if (curOrderingValueFlush > maxFlush)
+                if (orderingValueFlushInt > maxFlush)
                 {
                     maxFlush = orderingValueFlushInt;
                 }
@@ -546,8 +546,8 @@ namespace PokerBot2
                     return (orderingVal + cardRank, WinHandType.PAIR);
                 }
 
-                // The third top card is the pair, so grab the fourth one
-                return (orderingVal + GetRank(cards[^4]), WinHandType.PAIR);
+                // The third top card is the pair, so grab the fifth one
+                return (orderingVal + GetRank(cards[^5]), WinHandType.PAIR);
             }
 
             // High cards - Encode all the 5 highest
