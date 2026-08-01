@@ -337,7 +337,7 @@ namespace PokerBot2UnitTests
                     + (thirdRank << 12)
                     + (fourthRank << 18)
                     + (fifthRank << 24);
-                Assert.That(result.Item1, Is.EqualTo(expectedOrdering >> 12));
+                Assert.That(result.Item1, Is.EqualTo(expectedOrdering));
             });
         }
 
@@ -617,7 +617,7 @@ namespace PokerBot2UnitTests
                 var rank4 = Game.GetRank(Game.StringToCard("9♦"));
                 var rank5 = Game.GetRank(Game.StringToCard("K♦"));
                 var expectedOrdering = (rank1 << 0) + (rank2 << 6) + (rank3 << 12) + (rank4 << 18) + (rank5 << 24);
-                Assert.That(result.Item1, Is.EqualTo(expectedOrdering >> 12));
+                Assert.That(result.Item1, Is.EqualTo(expectedOrdering));
             });
         }
 
