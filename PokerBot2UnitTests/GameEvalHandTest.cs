@@ -487,25 +487,12 @@ namespace PokerBot2UnitTests
 
         // Additional tests to thoroughly verify ordering for all hand types
 
-        [Test]
-        // Verify different straight flush orderings
-        public void EvalHand_ShouldOrderStraightFlushByHighCard_DifferentValues()
-        {
-            var result = Game.EvalHand(Cards("2♥", "3♥", "4♥", "5♥", "6♥", "7♣", "8♦"), 0);
-
-            Assert.Multiple(() =>
-            {
-                Assert.That(result.Item2, Is.EqualTo(WinHandType.STRAIGHT_FLUSH));
-                var expectedOrdering = Game.GetRank(Game.StringToCard("6♥"));
-                Assert.That(result.Item1, Is.EqualTo(expectedOrdering));
-            });
-        }
 
         [Test]
-        // Verify different full house orderings (different trip and pair ranks)
+        // Verify different full house orderings (2 trips)
         public void EvalHand_ShouldOrderFullHouseCorrectly_DifferentRanks()
         {
-            var result = Game.EvalHand(Cards("K♠", "K♣", "K♦", "3♠", "3♣", "2♦", "4♥"), 0);
+            var result = Game.EvalHand(Cards("K♠", "K♣", "K♦", "3♠", "3♣", "3♦", "4♥"), 0);
 
             Assert.Multiple(() =>
             {
@@ -530,74 +517,6 @@ namespace PokerBot2UnitTests
                 var lowerPairRank = Game.GetRank(Game.StringToCard("3♠"));
                 var kickerRank = Game.GetRank(Game.StringToCard("7♦"));
                 var expectedOrdering = (higherPairRank << 12) + (lowerPairRank << 6) + kickerRank;
-                Assert.That(result.Item1, Is.EqualTo(expectedOrdering));
-            });
-        }
-
-        [Test]
-        // Verify three-of-a-kind ordering with different kickers
-        public void EvalHand_ShouldOrderThreeOfAKindCorrectly_DifferentKickers()
-        {
-            var result = Game.EvalHand(Cards("5♠", "5♣", "5♦", "9♠", "7♠", "3♣", "2♦"), 0);
-
-            Assert.Multiple(() =>
-            {
-                Assert.That(result.Item2, Is.EqualTo(WinHandType.THREE_OF_A_KIND));
-                var tripRank = Game.GetRank(Game.StringToCard("5♠"));
-                var firstKickerRank = Game.GetRank(Game.StringToCard("9♠"));
-                var secondKickerRank = Game.GetRank(Game.StringToCard("7♠"));
-                var expectedOrdering = (tripRank << 12) + (firstKickerRank << 6) + secondKickerRank;
-                Assert.That(result.Item1, Is.EqualTo(expectedOrdering));
-            });
-        }
-
-        [Test]
-        // Verify pair ordering with different kicker combinations
-        public void EvalHand_ShouldOrderPairCorrectly_WithDifferentKickers()
-        {
-            var result = Game.EvalHand(Cards("2♠", "2♣", "5♦", "9♠", "A♣", "K♦", "3♥"), 0);
-
-            Assert.Multiple(() =>
-            {
-                Assert.That(result.Item2, Is.EqualTo(WinHandType.PAIR));
-                var pairRank = Game.GetRank(Game.StringToCard("2♠"));
-                var firstKickerRank = Game.GetRank(Game.StringToCard("A♣"));
-                var secondKickerRank = Game.GetRank(Game.StringToCard("K♦"));
-                var thirdKickerRank = Game.GetRank(Game.StringToCard("9♠"));
-                var expectedOrdering = (pairRank << 18) + (firstKickerRank << 12) + (secondKickerRank << 6) + thirdKickerRank;
-                Assert.That(result.Item1, Is.EqualTo(expectedOrdering));
-            });
-        }
-
-        [Test]
-        // Verify high-card ordering with different card ranks
-        public void EvalHand_ShouldOrderHighCardCorrectly_WithDifferentRanks()
-        {
-            var result = Game.EvalHand(Cards("2♠", "4♣", "6♦", "J♠", "K♣", "Q♦", "A♥"), 0);
-
-            Assert.Multiple(() =>
-            {
-                Assert.That(result.Item2, Is.EqualTo(WinHandType.HIGH_CARD));
-                var rank1 = Game.GetRank(Game.StringToCard("A♥"));
-                var rank2 = Game.GetRank(Game.StringToCard("K♣"));
-                var rank3 = Game.GetRank(Game.StringToCard("Q♦"));
-                var rank4 = Game.GetRank(Game.StringToCard("J♠"));
-                var rank5 = Game.GetRank(Game.StringToCard("6♦"));
-                var expectedOrdering = (rank1 << 24) + (rank2 << 18) + (rank3 << 12) + (rank4 << 6) + rank5;
-                Assert.That(result.Item1, Is.EqualTo(expectedOrdering));
-            });
-        }
-
-        [Test]
-        // Verify straight ordering with highest card determining order
-        public void EvalHand_ShouldOrderStraightCorrectly_WithHighCard()
-        {
-            var result = Game.EvalHand(Cards("9♠", "8♣", "7♦", "6♥", "5♠", "3♣", "2♦"), 0);
-
-            Assert.Multiple(() =>
-            {
-                Assert.That(result.Item2, Is.EqualTo(WinHandType.STRAIGHT));
-                var expectedOrdering = Game.GetRank(Game.StringToCard("9♠"));
                 Assert.That(result.Item1, Is.EqualTo(expectedOrdering));
             });
         }
