@@ -115,8 +115,8 @@ namespace PokerBot2
         // is used to sort the win hand of the same type (higher = better, equal = same hand)
         // Note: input will be sort in place
 
-        private const long SIX_CARD_LIMIT = 1 << 30;
-        private const long SEVEN_CARD_LIMIT = 1 << 36;
+        private const long SIX_CARD_LIMIT = 1L << 30;
+        private const long SEVEN_CARD_LIMIT = 1L << 36;
         public static (int, WinHandType) EvalHand(Span<int> cards, int numFiller)
         {
             Debug.Assert(cards.Length == 7);
