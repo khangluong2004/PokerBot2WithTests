@@ -18,6 +18,14 @@ namespace PokerBot2
 
     public class Game
     {
+        // Special value for fold and all-in is set above the stack x 9, so impossible for normal bet
+        public const int FOLD_VALUE = 0b111_1111_1111_1111;
+        public const int ALL_IN_VALUE = 0b111_1111_1111_1110;
+
+        public const int SMALL_BLIND = 10;
+        public const int BIG_BLIND = 20;
+        public const int STACK = 2500;
+
         // Card = 1 - 52, following the rank-suit order [2♠, 2♣, 2♦, 2♥, 3♠, ...]
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int GetRank(int card)
