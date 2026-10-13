@@ -47,6 +47,7 @@ namespace PokerBot2
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        // TODO: Add pot amount
         public void RoundBet(ref Span<bool> isFold,
             ref Span<bool> isAllIn,
             ref Span<int> board, int numCard, 
@@ -91,6 +92,36 @@ namespace PokerBot2
 
                 curPlayer = (curPlayer + 1) % numPlayer;
             } while (curPlayer != actionPlayer);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void HandleShowdown(Span<int> board, Span<bool> isFold)
+        {
+            // TODO: Handle ties and splitting
+
+            // The 7 cards used for eval
+            Span<int> evalHand = stackalloc int[7];
+            evalHand[2] = board[0];
+            evalHand[3] = board[1];
+            evalHand[4] = board[2];
+            evalHand[5] = board[3];
+            evalHand[6] = board[4];
+
+            long maxEval = -1;
+            long curEval = -1;
+            int winner = -1;
+            int curOrderingValue = -1;
+            WinHandType curWinHand = WinHandType.HIGH_CARD;
+            for (int i=0; i < numPlayer; i++)
+            {
+                if (isFold[i])
+                {
+                    continue;
+                }
+
+                (evalHand[0], evalHand[1]) = agents[i].GetDealCard();
+                (curOrderingValue, curWinHand) = Game.EvalHand(evalHand, 0);
+            }
         }
 
         public void RoundPlay()
@@ -142,6 +173,7 @@ namespace PokerBot2
             // RIVER
             // Deal
             board[4] = game.DealCard();
+            history.Add(EncodeHistoryDealState());
 
             // Bet
             RoundBet(ref isFold, ref isAllIn, ref board,
@@ -149,6 +181,8 @@ namespace PokerBot2
 
             // TODO: Handle showdown & eval
 
+            // Shift dealer by 1
+            dealer = (dealer + 1) % numPlayer;
         }
     }
 }

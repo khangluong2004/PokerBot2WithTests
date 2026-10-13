@@ -125,7 +125,7 @@ namespace PokerBot2
 
         private const long SIX_CARD_LIMIT = 1L << 30;
         private const long SEVEN_CARD_LIMIT = 1L << 36;
-        public static (int, WinHandType) EvalHand(Span<int> cards, int numFiller)
+        public static (int orderingValue, WinHandType winHand) EvalHand(Span<int> cards, int numFiller)
         {
             Debug.Assert(cards.Length == 7);
             // Sorted by rank, due to the ordering defined
@@ -565,26 +565,5 @@ namespace PokerBot2
                 + (GetRank(cards[^4]) << 6)
                 + GetRank(cards[^5]), WinHandType.HIGH_CARD);
         }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        // playerNum starts from 0
-        private (int, WinHandType) EvalPlayer(int playerIndex)
-        {
-            Span<int> cards = stackalloc int[7];
-            cards[0] = Deck[playerIndex * 2];
-            cards[1] = Deck[playerIndex * 2 + 1];
-            int publicStart = NumPlayer * 2;
-            cards[2] = Deck[publicStart];
-            cards[3] = Deck[publicStart + 1];
-            cards[4] = Deck[publicStart + 2];
-            cards[5] = Deck[publicStart + 3];
-            cards[6] = Deck[publicStart + 4];
-
-            return EvalHand(cards, 0);
-        }
-
-        // TODO: Compile-time number of players for public int GetWinner()
-
-
     }
 }
