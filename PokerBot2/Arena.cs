@@ -35,9 +35,9 @@ namespace PokerBot2
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static int EncodeHistoryBetState(int playerId, int bet, int isFold, int isAllIn)
+        public static int EncodeHistoryBetState(int playerId, double bet, int isFold, int isAllIn)
         {
-            return (playerId) + (bet << 5) + (isFold << 20) + (isAllIn << 21);
+            return (playerId) + (((int) bet) << 5) + (isFold << 20) + (isAllIn << 21);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -47,27 +47,26 @@ namespace PokerBot2
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public (int pot, int activePlayers, int isFinished) RoundBet(ref Span<bool> isFold,
-            ref Span<int> isAllIn,
-            ref Span<int> entitledPot,
+        public (double pot, int activePlayers, int numAllIn, int isFinished) RoundBet(ref Span<bool> isFold,
+            ref Span<double> isAllIn,
+            ref Span<double> entitledPot,
             ref Span<int> board, 
             int numCard, 
-            int pot, int activePlayers,
-            int startBet, int startPlayer, int startRaise)
+            double pot, int activePlayers,
+            int numAllIn,
+            double startBet, int startPlayer, double startRaise)
         {
             int curPlayer = startPlayer;
             int actionPlayer = curPlayer;
 
-            int prevRaise = startRaise;
-            int maxBet = startBet;
-            int bet;
+            var prevRaise = startRaise;
+            var maxBet = startBet;
+            double bet;
 
             int winner = 0;
-            int prevPot = pot;
-            int preAllInMaxBet = maxBet;
-            int numAllIn = 0;
+            var preAllInMaxBet = maxBet;
 
-            Span<int> totalBet = stackalloc int[numPlayer];
+            Span<double> totalBet = stackalloc double[numPlayer];
             do
             {
                 if (!isFold[curPlayer] && isAllIn[curPlayer] == 0)
@@ -135,22 +134,30 @@ namespace PokerBot2
             // Splitting pot: Each player is entitled to the max of their betting
             if (numAllIn == 0)
             {
-
+                // If no all in so far, then everyone has the same pot
+                entitledPot.Fill(pot);
             } else
             {
 
+                for (int i = 0; i < numPlayer; i++)
+                {
+                    for (int j = 0; j < numPlayer; j++)
+                    {
+                        entitledPot[i] += Math.Min(totalBet[i], totalBet[j]);
+                    }
+                }
             }
 
-            return (pot, activePlayers, (activePlayers == 1 ? winner : -1));
+            return (pot, activePlayers, numAllIn, (activePlayers == 1 ? winner : -1));
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void HandleShowdown(Span<int> board, 
             Span<bool> isFold,
-            Span<int> isAllIn)
+            Span<double> isAllIn,
+            Span<double> entitledPot,
+            double pot)
         {
-            // TODO: Handle ties and splitting
-
             // The 7 cards used for eval
             Span<int> evalHand = stackalloc int[7];
             evalHand[2] = board[0];
@@ -159,25 +166,59 @@ namespace PokerBot2
             evalHand[5] = board[3];
             evalHand[6] = board[4];
 
-            Span<(long, int)> evalArr = stackalloc (long, int)[7];
+            Span<(long evalValue, double negEntitledPot, int playerIndex)> evalArr = 
+                stackalloc (long evalValue, double negEntitledPot, int playerIndex)[numPlayer];
 
             for (int i=0; i < numPlayer; i++)
             {
                 if (isFold[i])
                 {
-                    evalArr[i] = (-1, i);
+                    evalArr[i] = (-1, 0, i);
                     continue;
                 }
 
                 (evalHand[0], evalHand[1]) = agents[i].GetDealCard();
-                evalArr[i] = (Game.ToEvalValue(Game.EvalHand(evalHand, 0)), i);
+                evalArr[i] = (Game.ToEvalValue(Game.EvalHand(evalHand, 0)), -entitledPot[i],  i);
             }
 
             evalArr.Sort();
+            int counter = numPlayer;
+            long curMaxEval;
+            int numMaxEval;
+            double entitledShare;
+            // pot >= 1 to ignore any rounding errors
+            while (counter >= 0 && pot >= 1)
+            {
+                curMaxEval = evalArr[counter].evalValue;
+                numMaxEval = 1;
+
+                // Find out how many ties
+                counter--;
+                while (counter >= 0 && evalArr[counter].evalValue == curMaxEval)
+                {
+                    numMaxEval++;
+                    counter--;
+                }
+
+                // Resolve the ties
+                counter += numMaxEval;
+                for (int i = 0; i < numMaxEval; i++)
+                {
+                    // IMPORTANT: This engine doesn't give a fuck about odd chips, since too complicated for no
+                    // reason. So we'll allow fractional betting and stack size.
+                    entitledShare = -evalArr[counter].negEntitledPot / numMaxEval;
+                    agents[evalArr[counter].playerIndex].ReceiveReturn(
+                        entitledShare
+                    );
+                    pot -= entitledShare;
+                    counter--;
+                }
+            }
+
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void HandleEarlyFinish(int winner, int pot)
+        public void HandleEarlyFinish(int winner, double pot)
         {
             agents[winner].ReceiveReturn(pot);
             dealer = (dealer + 1) % numPlayer;
@@ -191,9 +232,10 @@ namespace PokerBot2
             }
 
             Span<bool> isFold = stackalloc bool[numPlayer];
-            Span<int> isAllIn = stackalloc int[numPlayer]; // Stored the all-in amount
-            Span<int> entitledPot = stackalloc int[numPlayer]; // Stored the pot entitled by each player
+            Span<double> isAllIn = stackalloc double[numPlayer]; // Stored the all-in amount
+            Span<double> entitledPot = stackalloc double[numPlayer]; // Stored the pot entitled by each player
             int activePlayers = numPlayer;
+            int numAllIn = 0;
 
 
             for (int i=0; i < numPlayer; i++)
@@ -201,7 +243,7 @@ namespace PokerBot2
                 isFold[i] = true;
             }
             Span<int> board = stackalloc int[5];
-            int pot = 0; 
+            double pot = 0; 
             int isFinished = -1;
 
             // PRE-FLOP
@@ -210,8 +252,8 @@ namespace PokerBot2
             history.Add(EncodeHistoryBetState(agents[(dealer + 2) % agents.Count].GetId(), Game.BIG_BLIND, 0, 0));
 
             // Bet
-            (pot, activePlayers, isFinished) = RoundBet(ref isFold, ref isAllIn, ref entitledPot, ref board, 
-                0, pot, activePlayers, Game.BIG_BLIND, (dealer + 3) % numPlayer, Game.BIG_BLIND);
+            (pot, activePlayers, numAllIn, isFinished) = RoundBet(ref isFold, ref isAllIn, ref entitledPot, ref board, 
+                0, pot, activePlayers, numAllIn, Game.BIG_BLIND, (dealer + 3) % numPlayer, Game.BIG_BLIND);
 
             if (isFinished != -1) {
                 HandleEarlyFinish(isFinished, pot);
@@ -226,8 +268,8 @@ namespace PokerBot2
             history.Add(EncodeHistoryDealState());
 
             // Bet
-            (pot, activePlayers, isFinished) = RoundBet(ref isFold, ref isAllIn, ref entitledPot, ref board,
-                3, pot, activePlayers, 0, (dealer + 1) % numPlayer, 0);
+            (pot, activePlayers, numAllIn, isFinished) = RoundBet(ref isFold, ref isAllIn, ref entitledPot, ref board,
+                3, pot, activePlayers, numAllIn, 0, (dealer + 1) % numPlayer, 0);
 
             if (isFinished != -1)
             {
@@ -241,8 +283,8 @@ namespace PokerBot2
             history.Add(EncodeHistoryDealState());
 
             // Bet
-            (pot, activePlayers, isFinished) = RoundBet(ref isFold, ref isAllIn, ref entitledPot, ref board,
-                4, pot, activePlayers, 0, (dealer + 1) % numPlayer, 0);
+            (pot, activePlayers, numAllIn, isFinished) = RoundBet(ref isFold, ref isAllIn, ref entitledPot, ref board,
+                4, pot, activePlayers, numAllIn, 0, (dealer + 1) % numPlayer, 0);
 
             if (isFinished != -1)
             {
@@ -256,10 +298,10 @@ namespace PokerBot2
             history.Add(EncodeHistoryDealState());
 
             // Bet
-            (pot, activePlayers, isFinished) = RoundBet(ref isFold, ref isAllIn, ref entitledPot, ref board,
-                5, pot, activePlayers, 0, (dealer + 1) % numPlayer, 0);
+            (pot, activePlayers, numAllIn, isFinished) = RoundBet(ref isFold, ref isAllIn, ref entitledPot, ref board,
+                5, pot, activePlayers, numAllIn, 0, (dealer + 1) % numPlayer, 0);
 
-            HandleShowdown();
+            HandleShowdown(board, isFold, isAllIn, entitledPot, pot);
         }
     }
 }

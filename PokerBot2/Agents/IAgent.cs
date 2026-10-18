@@ -13,12 +13,12 @@ namespace PokerBot2.Agents
         // Return value: 0b1111_1111_1111_1111 = fold, same value as previous = call, raise = higher value than previous bet
         // All-in: Return a special value to signal all-in. The arena will call a separate function to retrieve the bet amount.
         // Raised amount >= previous raised amount
-        public int Play(IList<int> history, Span<int> board);
+        public double Play(IList<int> history, Span<int> board);
         // Return the full stack, and rest player stack to 0
-        public int AllIn();
+        public double AllIn();
         public int GetId();
-        public int GetStack();
+        public double GetStack();
 
-        public int ReceiveReturn(int money);
+        public void ReceiveReturn(double money);
     }
 }
