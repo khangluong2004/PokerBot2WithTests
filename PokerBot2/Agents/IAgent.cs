@@ -11,9 +11,11 @@ namespace PokerBot2.Agents
         public void ReceiveDealCard(int card1, int card2);
         public (int card1, int card2) GetDealCard();
         // Return value: 0b1111_1111_1111_1111 = fold, same value as previous = call, raise = higher value than previous bet
-        // All-in: Raise to full stacks
+        // All-in: Return a special value to signal all-in. The arena will call a separate function to retrieve the bet amount.
         // Raised amount >= previous raised amount
         public int Play(IList<int> history, Span<int> board);
+        // Return the full stack, and rest player stack to 0
+        public int AllIn();
         public int GetId();
         public int GetStack();
 

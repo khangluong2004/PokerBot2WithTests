@@ -565,5 +565,13 @@ namespace PokerBot2
                 + (GetRank(cards[^4]) << 6)
                 + GetRank(cards[^5]), WinHandType.HIGH_CARD);
         }
+
+        // Combine the ordering value and WinHandType from EvalHand 
+        // to a single long value for faster comparison
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static long ToEvalValue((int, WinHandType) evalHandReturn)
+        {
+            return (((long)evalHandReturn.Item2) << 32) + evalHandReturn.Item1;
+        }
     }
 }
