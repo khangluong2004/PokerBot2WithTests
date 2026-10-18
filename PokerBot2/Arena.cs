@@ -8,7 +8,7 @@ namespace PokerBot2
     {
         public static int DEALER_HISTORY_STATE = 11;
 
-        // Game structure: 10-20 big blind, 2500 stack per player, up to 9 players
+        // Game structure: 10 small blind, 20 big blind, 2500 stack per player, up to 9 players
         int numPlayer;
         int dealer = 0;
         IList<IAgent> agents = [];
@@ -35,9 +35,9 @@ namespace PokerBot2
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static int EncodeHistoryBetState(int playerId, double bet, int isFold, int isAllIn)
+        public static int EncodeHistoryBetState(int playerId, int bet, int isFold, int isAllIn)
         {
-            return (playerId) + (((int) bet) << 5) + (isFold << 20) + (isAllIn << 21);
+            return (playerId) + (bet << 5) + (isFold << 20) + (isAllIn << 21);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -61,7 +61,7 @@ namespace PokerBot2
 
             var prevRaise = startRaise;
             var maxBet = startBet;
-            double bet;
+            int bet;
 
             int winner = 0;
             var preAllInMaxBet = maxBet;

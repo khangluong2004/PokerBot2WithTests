@@ -8,7 +8,7 @@ namespace PokerBot2.Agents
     public class HumanPlayer : IAgent
     {
         private int playerPosition;
-        private int stack;
+        private double stack;
         private int lowCard;
         private int highCard;
         private int playerId;
@@ -62,9 +62,31 @@ namespace PokerBot2.Agents
             return bet;
         }
 
+        public (int card1, int card2) GetDealCard()
+        {
+            return (lowCard, highCard);
+        }
+
+        public double AllIn()
+        {
+            var allIn = stack;
+            stack = 0;
+            return allIn;
+        }
+
         public int GetId()
         {
             return playerId;
+        }
+
+        public double GetStack()
+        {
+            return stack;
+        }
+
+        public void ReceiveReturn(double money)
+        {
+            stack += money;
         }
     }
 }
