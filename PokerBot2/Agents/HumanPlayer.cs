@@ -40,23 +40,27 @@ namespace PokerBot2.Agents
             }
         }
 
-        public int Play(IList<int> history, Span<int> board)
+        public double Play(IList<int> history, Span<int> board, double toCall, double minRaise)
         {
             // Decide and return the bet amount
             bool validResponse = false;
-            int bet = -1;
+            double bet = -1;
             while (!validResponse)
             {
-                Console.Write($"Player[{playerId}][{Game.CardToString(lowCard)}, {Game.CardToString(highCard)}]: ");
-                validResponse = int.TryParse(Console.ReadLine(), out bet);
+                Console.Write($"Player[{playerId}][{Game.CardToString(lowCard)}, {Game.CardToString(highCard)}] to call {toCall}, min raise {minRaise}: ");
+                validResponse = double.TryParse(Console.ReadLine(), out bet);
             }
 
-            Debug.Assert(bet <= stack, "Can't bet more than stack");
+            // -1 = fold, -2 = all-in, otherwise the chips put in
             if (bet == -1)
             {
                 bet = Game.FOLD_VALUE;
+            } else if (bet == -2)
+            {
+                bet = Game.ALL_IN_VALUE;
             } else
             {
+                Debug.Assert(bet <= stack, "Can't bet more than stack");
                 stack -= bet;
             }
             return bet;
