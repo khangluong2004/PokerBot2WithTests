@@ -245,8 +245,17 @@ namespace PokerBot2
                 pnl[i] = -handBet[i];
             }
 
-            // The 7 cards used for eval
-            Span<int> evalHand = stackalloc int[7];
+            // Evaluate all players at once (AVX-512 batch when available) from the shared board mask
+            ulong boardMask = Game.ToHandMask(board);
+            Span<ulong> handMasks = stackalloc ulong[numPlayer];
+            Span<long> evalValues = stackalloc long[numPlayer];
+            int card1, card2;
+            for (int i=0; i < numPlayer; i++)
+            {
+                (card1, card2) = agents[i].GetDealCard();
+                handMasks[i] = boardMask | Game.ToCardMask(card1) | Game.ToCardMask(card2);
+            }
+            Game.EvalHandValues(handMasks, evalValues);
 
             Span<(long evalValue, double negEntitledPot, int playerIndex)> evalArr = 
                 stackalloc (long evalValue, double negEntitledPot, int playerIndex)[numPlayer];
@@ -259,10 +268,7 @@ namespace PokerBot2
                     continue;
                 }
 
-                // EvalHand sorts in place, so the board has to be copied in again for every player
-                board.CopyTo(evalHand[2..]);
-                (evalHand[0], evalHand[1]) = agents[i].GetDealCard();
-                evalArr[i] = (Game.ToEvalValue(Game.EvalHand(evalHand, 0)), -entitledPot[i],  i);
+                evalArr[i] = (evalValues[i], -entitledPot[i],  i);
             }
 
             evalArr.Sort();

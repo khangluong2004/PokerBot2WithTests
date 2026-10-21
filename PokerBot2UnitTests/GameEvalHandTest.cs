@@ -197,8 +197,8 @@ namespace PokerBot2UnitTests
 
             Assert.Multiple(() =>
             {
-                Assert.That(result.Item2, Is.EqualTo(WinHandType.HIGH_CARD));
-                // High-card ordering packs the five highest ranks into 6-bit slots.
+                Assert.That(result.Item2, Is.EqualTo(WinHandType.FLUSH));
+                // A 7-card flush keeps only the five highest ranks, packed into 6-bit slots.
                 var firstRank = Game.GetRank(Game.StringToCard("A♠"));
                 var secondRank = Game.GetRank(Game.StringToCard("K♠"));
                 var thirdRank = Game.GetRank(Game.StringToCard("Q♠"));

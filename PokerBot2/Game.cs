@@ -1,4 +1,8 @@
 ﻿using System.Diagnostics;
+using System.Numerics;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Runtime.CompilerServices;
 
 namespace PokerBot2
@@ -117,453 +121,285 @@ namespace PokerBot2
             return Deck[CurDealtCard++];
         }
 
-        // input = 7 cards (if not enough, add negative filler cards, all -4,
+        // input = up to 7 cards (if not enough, add negative filler cards, all -4,
         // avoid confusion with 2). MUST have at least 1 non-filler.
         // Return (ordering value, win hand type), where the ordering value
         // is used to sort the win hand of the same type (higher = better, equal = same hand)
-        // Note: input will be sort in place
-
-        private const long SIX_CARD_LIMIT = 1L << 30;
-        private const long SEVEN_CARD_LIMIT = 1L << 36;
+        // Missing kickers (fewer than 5 real cards) count as rank -1, same as a filler card.
+        // Note: input is NOT modified (no sorting needed)
         public static (int orderingValue, WinHandType winHand) EvalHand(Span<int> cards, int numFiller)
         {
             Debug.Assert(cards.Length == 7);
-            // Sorted by rank, due to the ordering defined
-            cards.Sort();
+            return EvalHand(ToHandMask(cards));
+        }
 
-            int prevSuit = GetSuit(cards[numFiller]);
-            int prevRank = GetRank(cards[numFiller]);
-            int orderingVal;
+        // Hand mask: 16 bits per suit (suit * 16 + rank), so the 4 suits are 4 lanes of one ulong
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ulong ToCardMask(int card)
+        {
+            return 1UL << (((card & 0b11) << 4) + (card >> 2));
+        }
 
-            // Trip + Quad + Pair
-            Span<int> highestSameRank = stackalloc int[4];
-            highestSameRank[0] = highestSameRank[1] = highestSameRank[2] = highestSameRank[3] = -1;
-            int sameRankCount = 0;
-            int highestPairNotHighestTrip = -1; // Store the second highest pair
-
-            // Straight
-            int highestInStraight = -1;
-            int straightCount = 1;
-
-            // Straight flush - Per suit computation
-            Span<int> highestInStraightFlush = stackalloc int[4];
-            highestInStraightFlush[0]
-                = highestInStraightFlush[1]
-                = highestInStraightFlush[2]
-                = highestInStraightFlush[3]
-                = -1;
-
-            Span<int> highestSoFarInStraightFlush = stackalloc int[4];
-            highestSoFarInStraightFlush[0]
-                = highestSoFarInStraightFlush[1]
-                = highestSoFarInStraightFlush[2]
-                = highestSoFarInStraightFlush[3]
-                = -1;
-            highestSoFarInStraightFlush[prevSuit] = prevRank;
-
-            Span<int> countStraightFlush = stackalloc int[4];
-            countStraightFlush[prevSuit] = 1;
-            int rankDiffStraightFlush;
-
-            // Count the ace before hand to deal with the straight wrap around
-            Span<bool> hasAceSuit = stackalloc bool[4];
-            bool hasAce = false;
-            int lastCardRank = GetRank(cards[^1]);
-            if (lastCardRank == 12)
+        // Filler cards (negative) are skipped
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ulong ToHandMask(ReadOnlySpan<int> cards)
+        {
+            ulong mask = 0;
+            for (int i = 0; i < cards.Length; i++)
             {
-                hasAceSuit[GetSuit(cards[^1])] = true;
-                hasAce = true;
-                if (GetRank(cards[^2]) == 12)
+                if (cards[i] >= 0)
                 {
-                    hasAceSuit[GetSuit(cards[^2])] = true;
-                    if (GetRank(cards[^3]) == 12)
-                    {
-                        hasAceSuit[GetSuit(cards[^3])] = true;
-                        if (GetRank(cards[^4]) == 12)
-                        {
-                            hasAceSuit[GetSuit(cards[^4])] = true;
-                        }
-                    }
+                    mask |= ToCardMask(cards[i]);
+                }
+            }
+            return mask;
+        }
+
+        // Same as ToEvalValue(EvalHand(handMask)), without the tuple
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static long EvalHandValue(ulong handMask)
+        {
+            return ToEvalValue(EvalHand(handMask));
+        }
+
+        // Rank of the highest set bit, -1 if empty (lzcnt(0) = 32)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int TopRank(uint ranks)
+        {
+            return 31 - BitOperations.LeadingZeroCount(ranks);
+        }
+
+        // Pack the top n ranks into 6-bit fields, highest first. Missing ranks are -1 (like fillers).
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int TopRanks(uint ranks, int n)
+        {
+            int packed = 0;
+            for (int i = 0; i < n; i++)
+            {
+                int top = TopRank(ranks);
+                packed = (packed << 6) + top;
+                // No-op when empty: 0 & anything = 0
+                ranks &= ~(1u << top);
+            }
+            return packed;
+        }
+
+        // Highest rank of a 5-card straight in the rank mask, -1 if none. Ace also counts as the lowest card.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int StraightTop(uint ranks)
+        {
+            // Bit 0 = ace low, bit (rank + 1) = rank
+            uint m = (ranks << 1) | ((ranks >> 12) & 1);
+            uint s = m & (m >> 1) & (m >> 2) & (m >> 3) & (m >> 4);
+            // Bit j of s = straight from shifted bit j to j + 4, top rank = j + 4 - 1
+            return s == 0 ? -1 : TopRank(s) + 3;
+        }
+
+        public static (int orderingValue, WinHandType winHand) EvalHand(ulong handMask)
+        {
+            uint spade = (uint)handMask & 0x1FFF;
+            uint club = (uint)(handMask >> 16) & 0x1FFF;
+            uint diamond = (uint)(handMask >> 32) & 0x1FFF;
+            uint heart = (uint)(handMask >> 48) & 0x1FFF;
+
+            // Rank counts from the 4 suit masks: a rank is in "two" if at least 2 suits have it, and so on
+            uint sc = spade & club, dh = diamond & heart;
+            uint spadeOrClub = spade | club, diamondOrHeart = diamond | heart;
+            uint ranks = spadeOrClub | diamondOrHeart;
+            uint two = sc | dh | (spadeOrClub & diamondOrHeart);
+            uint three = (sc & diamondOrHeart) | (dh & spadeOrClub);
+            uint four = sc & dh;
+
+            // Flush (at most 1 suit can have 5+ out of 7 cards)
+            uint flush = 0;
+            if (BitOperations.PopCount(spade) >= 5) flush = spade;
+            else if (BitOperations.PopCount(club) >= 5) flush = club;
+            else if (BitOperations.PopCount(diamond) >= 5) flush = diamond;
+            else if (BitOperations.PopCount(heart) >= 5) flush = heart;
+
+            if (flush != 0)
+            {
+                int straightFlush = StraightTop(flush);
+                if (straightFlush >= 0)
+                {
+                    return (straightFlush, WinHandType.STRAIGHT_FLUSH);
                 }
             }
 
-            // Handle the first 4 cards if they are 2, to handle wrap around for straight + straight flush
-            // Straight
-            if (prevRank == 0 && hasAce)
+            if (four != 0)
             {
-                straightCount = 2;
+                int quad = TopRank(four);
+                return ((quad << 6) + TopRank(ranks & ~(1u << quad)), WinHandType.QUAD);
             }
 
-            // Straight flush
-            Span<int> noFillerCards = cards[numFiller..];
-            if (prevRank == 0)
+            if (three != 0)
             {
-                if (hasAceSuit[prevSuit])
+                int trip = TopRank(three);
+                // The pair can also be a second trip
+                uint pairs = two & ~(1u << trip);
+                if (pairs != 0)
                 {
-                    countStraightFlush[prevSuit] = 2;
-                    // highestSoFar already sets when init
-                }
-                if (noFillerCards.Length >= 2 && GetRank(noFillerCards[1]) == 0)
-                {
-                    var suit = GetSuit(noFillerCards[1]);
-                    if (hasAceSuit[suit])
-                    {
-                        countStraightFlush[suit] = 2;
-                        highestSoFarInStraightFlush[suit] = 0;
-                    }
-
-                    if (noFillerCards.Length >= 3 && GetRank(noFillerCards[2]) == 0)
-                    {
-                        suit = GetSuit(noFillerCards[2]);
-                        if (hasAceSuit[suit])
-                        {
-                            countStraightFlush[suit] = 2;
-                            highestSoFarInStraightFlush[suit] = 0;
-                        }
-
-                        if (noFillerCards.Length >= 4 && GetRank(noFillerCards[3]) == 0)
-                        {
-                            suit = GetSuit(noFillerCards[3]);
-                            if (hasAceSuit[suit])
-                            {
-                                countStraightFlush[suit] = 2;
-                                highestSoFarInStraightFlush[suit] = 0;
-                            }
-
-                        }
-                    }
+                    return ((trip << 6) + TopRank(pairs), WinHandType.FULL_HOUSE);
                 }
             }
 
-            // Flush
-            Span<int> flushCount = stackalloc int[4];
-            flushCount[prevSuit] = 1;
-            Span<long> orderingValueFlush = stackalloc long[4]; // Store the ordering value of flush
-            orderingValueFlush[prevSuit] = prevRank;
-
-
-            int curSuit, curRank, rankDiff;
-            for (int i = numFiller + 1; i < cards.Length; i++)
+            if (flush != 0)
             {
-                curSuit = GetSuit(cards[i]);
-                curRank = GetRank(cards[i]);
-
-                // Straight flush
-                // Like straight, but for each suit
-                rankDiffStraightFlush = curRank - highestSoFarInStraightFlush[curSuit];
-                if (rankDiffStraightFlush == 1)
-                {
-                    countStraightFlush[curSuit]++;
-                    if (countStraightFlush[curSuit] >= 5)
-                    {
-                        highestInStraightFlush[curSuit] = curRank;
-                    }
-                }
-                else if (rankDiffStraightFlush != 0)
-                {
-                    countStraightFlush[curSuit] = 1;
-                }
-                highestSoFarInStraightFlush[curSuit] = curRank;
-
-                // Flush
-                orderingValueFlush[curSuit] += curRank << (6 * flushCount[curSuit]);
-                flushCount[curSuit] += 1;
-
-                // Straight
-                rankDiff = curRank - prevRank;
-                if (rankDiff == 1)
-                {
-                    straightCount++;
-                    if (straightCount >= 5)
-                    {
-                        highestInStraight = curRank;
-                    }
-                }
-                else if (rankDiff != 0)
-                {
-                    straightCount = 1;
-                }
-
-                // Pair + Trip + Quad
-                if (rankDiff == 0)
-                {
-                    sameRankCount += 1;
-                }
-                else
-                {
-                    sameRankCount = 0;
-                }
-
-                // Copy the old highest card of [rank] to [rank-1] to still retain
-                // the highest pair that's not a trip to handle full house
-                // highestPairNotTrip will remain -1 if there is no pair that's not trip
-                if (sameRankCount == 1)
-                {
-                    highestPairNotHighestTrip = highestSameRank[1];
-                }
-                highestSameRank[sameRankCount] = curRank;
-
-                prevRank = curRank;
-                prevSuit = curSuit;
+                return (TopRanks(flush, 5), WinHandType.FLUSH);
             }
 
-            // Return from top hand to bottom
-            // Straight flush manual unroll
-            int maxStraightFlush = highestInStraightFlush[0];
-            if (highestInStraightFlush[1] > maxStraightFlush)
+            int straight = StraightTop(ranks);
+            if (straight >= 0)
             {
-                maxStraightFlush = highestInStraightFlush[1];
+                return (straight, WinHandType.STRAIGHT);
             }
 
-            if (highestInStraightFlush[2] > maxStraightFlush)
+            if (three != 0)
             {
-                maxStraightFlush = highestInStraightFlush[2];
+                int trip = TopRank(three);
+                return ((trip << 12) + TopRanks(ranks & ~(1u << trip), 2), WinHandType.THREE_OF_A_KIND);
             }
 
-            if (highestInStraightFlush[3] > maxStraightFlush)
+            if (two != 0)
             {
-                maxStraightFlush = highestInStraightFlush[3];
+                int highPair = TopRank(two);
+                uint otherPairs = two & ~(1u << highPair);
+                if (otherPairs != 0)
+                {
+                    int lowPair = TopRank(otherPairs);
+                    // The kicker can come from a third pair
+                    return ((highPair << 12) + (lowPair << 6) + TopRank(ranks & ~((1u << highPair) | (1u << lowPair))),
+                        WinHandType.TWO_PAIR);
+                }
+                return ((highPair << 18) + TopRanks(ranks & ~(1u << highPair), 3), WinHandType.PAIR);
             }
 
-            if (maxStraightFlush > 0)
-            {
-                return (maxStraightFlush, WinHandType.STRAIGHT_FLUSH);
-            }
+            return (TopRanks(ranks, 5), WinHandType.HIGH_CARD);
+        }
 
-            // QUAD
-            if (highestSameRank[3] >= 0)
+        // Evaluate many hands at once: values[i] = EvalHandValue(handMasks[i]).
+        // Uses AVX-512 (8 hands per instruction, branch-free) when available, scalar otherwise.
+        public static void EvalHandValues(ReadOnlySpan<ulong> handMasks, Span<long> values)
+        {
+            Debug.Assert(values.Length >= handMasks.Length);
+            int i = 0;
+            if (Vector512.IsHardwareAccelerated && Avx512CD.IsSupported)
             {
-                if (highestSameRank[3] == lastCardRank)
+                ref ulong src = ref MemoryMarshal.GetReference(handMasks);
+                ref long dst = ref MemoryMarshal.GetReference(values);
+                for (; i + Vector512<ulong>.Count <= handMasks.Length; i += Vector512<ulong>.Count)
                 {
-                    return ((highestSameRank[3] << 6) + GetRank(cards[^5]), WinHandType.QUAD);
-                }
-                else
-                {
-                    return ((highestSameRank[3] << 6) + GetRank(cards[^1]), WinHandType.QUAD);
-                }
-            }
-
-            // For full house, encode the pair highest in the last 6 bits, and the trip highest in the next 6 bits
-            if (highestSameRank[2] >= 0 && highestPairNotHighestTrip >= 0)
-            {
-                if (highestSameRank[1] != highestSameRank[2])
-                {
-                    highestPairNotHighestTrip = highestSameRank[1];
-                }
-                return ((highestSameRank[2] << 6) + highestPairNotHighestTrip, WinHandType.FULL_HOUSE);
-            }
-
-            // Flush. Manual loop unroll :0 Fuck the jit
-            int maxFlush = -1;
-            int orderingValueFlushInt = -1;
-            long curOrderingValueFlush;
-            if (flushCount[0] >= 5)
-            {
-                curOrderingValueFlush = orderingValueFlush[0];
-                if (curOrderingValueFlush >= SEVEN_CARD_LIMIT)
-                {
-                    orderingValueFlushInt = (int)(curOrderingValueFlush >> 12);
-                }
-                else if (curOrderingValueFlush >= SIX_CARD_LIMIT)
-                {
-                    orderingValueFlushInt = (int)(curOrderingValueFlush >> 6);
-                }
-                else
-                {
-                    orderingValueFlushInt = (int)curOrderingValueFlush;
-                }
-
-                if (orderingValueFlushInt > maxFlush)
-                {
-                    maxFlush = orderingValueFlushInt;
+                    EvalHandValues512(Vector512.LoadUnsafe(ref src, (nuint)i)).StoreUnsafe(ref dst, (nuint)i);
                 }
             }
-
-            if (flushCount[1] >= 5)
+            for (; i < handMasks.Length; i++)
             {
-                curOrderingValueFlush = orderingValueFlush[1];
-                if (curOrderingValueFlush >= SEVEN_CARD_LIMIT)
-                {
-                    orderingValueFlushInt = (int)(curOrderingValueFlush >> 12);
-                }
-                else if (curOrderingValueFlush >= SIX_CARD_LIMIT)
-                {
-                    orderingValueFlushInt = (int)(curOrderingValueFlush >> 6);
-                }
-                else
-                {
-                    orderingValueFlushInt = (int)curOrderingValueFlush;
-                }
-
-                if (orderingValueFlushInt > maxFlush)
-                {
-                    maxFlush = orderingValueFlushInt;
-                }
+                values[i] = EvalHandValue(handMasks[i]);
             }
+        }
 
-            if (flushCount[2] >= 5)
+        // Vector version of TopRank: 63 - lzcnt per lane, -1 if empty
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector512<long> TopRank512(Vector512<ulong> ranks)
+        {
+            return Vector512.Create(63L) - Avx512CD.LeadingZeroCount(ranks).AsInt64();
+        }
+
+        // Clear the bit of rank per lane. Rank -1 (empty) is a shift count >= 64, so nothing is cleared
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector512<ulong> ClearRank512(Vector512<ulong> ranks, Vector512<long> rank)
+        {
+            return ranks & ~Avx512F.ShiftLeftLogicalVariable(Vector512<ulong>.One, rank.AsUInt64());
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector512<long> TopRanks512(Vector512<ulong> ranks, int n)
+        {
+            var packed = Vector512<long>.Zero;
+            for (int i = 0; i < n; i++)
             {
-                curOrderingValueFlush = orderingValueFlush[2];
-                if (curOrderingValueFlush >= SEVEN_CARD_LIMIT)
-                {
-                    orderingValueFlushInt = (int)(curOrderingValueFlush >> 12);
-                }
-                else if (curOrderingValueFlush >= SIX_CARD_LIMIT)
-                {
-                    orderingValueFlushInt = (int)(curOrderingValueFlush >> 6);
-                }
-                else
-                {
-                    orderingValueFlushInt = (int)curOrderingValueFlush;
-                }
-
-                if (orderingValueFlushInt > maxFlush)
-                {
-                    maxFlush = orderingValueFlushInt;
-                }
+                var top = TopRank512(ranks);
+                packed = (packed << 6) + top;
+                ranks = ClearRank512(ranks, top);
             }
+            return packed;
+        }
 
-            if (flushCount[3] >= 5)
-            {
-                curOrderingValueFlush = orderingValueFlush[3];
-                if (curOrderingValueFlush >= SEVEN_CARD_LIMIT)
-                {
-                    orderingValueFlushInt = (int)(curOrderingValueFlush >> 12);
-                }
-                else if (curOrderingValueFlush >= SIX_CARD_LIMIT)
-                {
-                    orderingValueFlushInt = (int)(curOrderingValueFlush >> 6);
-                }
-                else
-                {
-                    orderingValueFlushInt = (int)curOrderingValueFlush;
-                }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector512<long> StraightTop512(Vector512<ulong> ranks)
+        {
+            var m = (ranks << 1) | ((ranks >> 12) & Vector512<ulong>.One);
+            var s = m & (m >> 1) & (m >> 2) & (m >> 3) & (m >> 4);
+            return Vector512.ConditionalSelect(Vector512.Equals(s, Vector512<ulong>.Zero).AsInt64(),
+                Vector512.Create(-1L), TopRank512(s) + Vector512.Create(3L));
+        }
 
-                if (orderingValueFlushInt > maxFlush)
-                {
-                    maxFlush = orderingValueFlushInt;
-                }
-            }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector512<long> NonZero512(Vector512<ulong> v)
+        {
+            return ~Vector512.Equals(v, Vector512<ulong>.Zero).AsInt64();
+        }
 
-            if (maxFlush >= 0)
-            {
-                return (maxFlush, WinHandType.FLUSH);
-            }
+        // Same as EvalHandValue for 8 hands. All hand types are computed, then the best one is selected per lane.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector512<long> EvalHandValues512(Vector512<ulong> hand)
+        {
+            var rankBits = Vector512.Create(0x1FFFUL);
+            var spade = hand & rankBits;
+            var club = (hand >> 16) & rankBits;
+            var diamond = (hand >> 32) & rankBits;
+            var heart = (hand >> 48) & rankBits;
 
-            // Straight
-            if (highestInStraight >= 0)
-            {
-                return (highestInStraight, WinHandType.STRAIGHT);
-            }
+            var sc = spade & club;
+            var dh = diamond & heart;
+            var spadeOrClub = spade | club;
+            var diamondOrHeart = diamond | heart;
+            var ranks = spadeOrClub | diamondOrHeart;
+            var two = sc | dh | (spadeOrClub & diamondOrHeart);
+            var three = (sc & diamondOrHeart) | (dh & spadeOrClub);
+            var four = sc & dh;
 
-            // Trip
-            if (highestSameRank[2] >= 0)
-            {
-                var tripCard = highestSameRank[2];
-                orderingVal = (tripCard << 12);
-                // Grab the other 2 highest card
-                var rankCheck = GetRank(cards[^1]);
-                if (rankCheck != tripCard)
-                {
-                    orderingVal += (rankCheck << 6);
-                }
-                else
-                {
-                    // Top card is trip, so grab the next 2
-                    return (orderingVal
-                        + (GetRank(cards[^4]) << 6)
-                        + GetRank(cards[^5])
-                        , WinHandType.THREE_OF_A_KIND);
-                }
+            // Flush: popcount of the 4 suit lanes (16 bits each) at once, then keep the suit lane with 5+ cards
+            var count = hand - ((hand >> 1) & Vector512.Create(0x5555555555555555UL));
+            count = (count & Vector512.Create(0x3333333333333333UL)) + ((count >> 2) & Vector512.Create(0x3333333333333333UL));
+            count = (count + (count >> 4)) & Vector512.Create(0x0F0F0F0F0F0F0F0FUL);
+            count = (count + (count >> 8)) & Vector512.Create(0x00FF00FF00FF00FFUL);
+            // count <= 13 per lane, so count + 11 has bit 4 set exactly when count >= 5
+            var isFlushSuit = ((count + Vector512.Create(0x000B000B000B000BUL)) >> 4) & Vector512.Create(0x0001000100010001UL);
+            var flushBits = hand & ((isFlushSuit << 16) - isFlushSuit);
+            var flush = (flushBits | (flushBits >> 16) | (flushBits >> 32) | (flushBits >> 48)) & rankBits;
 
-                rankCheck = GetRank(cards[^2]);
-                if (rankCheck != tripCard)
-                {
-                    orderingVal += rankCheck;
-                }
-                else
-                {
-                    // Second card is trip, so grab the next one
-                    return (orderingVal
-                        + GetRank(cards[^5])
-                        , WinHandType.THREE_OF_A_KIND);
-                }
+            var quad = TopRank512(four);
+            var trip = TopRank512(three);
+            var fullHousePairs = ClearRank512(two, trip);
+            var highPair = TopRank512(two);
+            var otherPairs = ClearRank512(two, highPair);
+            var lowPair = TopRank512(otherPairs);
+            var straight = StraightTop512(ranks);
+            var straightFlush = StraightTop512(flush);
 
-                return (orderingVal, WinHandType.THREE_OF_A_KIND);
-            }
-
-            if (highestSameRank[1] >= 0)
-            {
-                int cardRank;
-                if (highestPairNotHighestTrip >= 0)
-                {
-                    orderingVal = (highestSameRank[1] << 12) + (highestPairNotHighestTrip << 6);
-                    cardRank = GetRank(cards[^1]);
-                    if (cardRank != highestSameRank[1])
-                    {
-                        return (orderingVal + cardRank, WinHandType.TWO_PAIR);
-                    }
-
-                    // Highest 2 cards = highest pair, so check second pair
-                    cardRank = GetRank(cards[^3]);
-                    if (cardRank != highestPairNotHighestTrip)
-                    {
-                        return (orderingVal + cardRank, WinHandType.TWO_PAIR);
-                    }
-
-                    // If the other 2 matches, then the fifth card is the kicker
-                    return (orderingVal + GetRank(cards[^5]), WinHandType.TWO_PAIR);
-
-                }
-
-                // Pair
-                var pairRank = highestSameRank[1];
-                orderingVal = (pairRank << 18);
-                cardRank = GetRank(cards[^1]);
-                if (cardRank != pairRank)
-                {
-                    orderingVal += (cardRank << 12);
-                }
-                else
-                {
-                    // Top card is already top pair, so grab the next 3
-                    return (orderingVal
-                        + (GetRank(cards[^3]) << 12)
-                        + (GetRank(cards[^4]) << 6)
-                        + GetRank(cards[^5])
-                        , WinHandType.PAIR);
-                }
-
-                cardRank = GetRank(cards[^2]);
-                if (cardRank != pairRank)
-                {
-                    orderingVal += (cardRank << 6);
-                }
-                else
-                {
-                    // Second card is top pair, grab the next 2
-                    return (orderingVal
-                        + (GetRank(cards[^4]) << 6)
-                        + GetRank(cards[^5])
-                        , WinHandType.PAIR);
-                }
-
-                cardRank = GetRank(cards[^3]);
-                if (cardRank != pairRank)
-                {
-                    return (orderingVal + cardRank, WinHandType.PAIR);
-                }
-
-                // The third top card is the pair, so grab the fifth one
-                return (orderingVal + GetRank(cards[^5]), WinHandType.PAIR);
-            }
-
-            // High cards - Encode all the 5 highest
-            return ((lastCardRank << 24) 
-                + (GetRank(cards[^2]) << 18)
-                + (GetRank(cards[^3]) << 12)
-                + (GetRank(cards[^4]) << 6)
-                + GetRank(cards[^5]), WinHandType.HIGH_CARD);
+            // From the lowest to the highest hand type, so a better hand overrides
+            var result = TopRanks512(ranks, 5) + Vector512.Create((long)WinHandType.HIGH_CARD << 32);
+            result = Vector512.ConditionalSelect(NonZero512(two),
+                (highPair << 18) + TopRanks512(ClearRank512(ranks, highPair), 3)
+                    + Vector512.Create((long)WinHandType.PAIR << 32), result);
+            result = Vector512.ConditionalSelect(NonZero512(otherPairs),
+                (highPair << 12) + (lowPair << 6) + TopRank512(ClearRank512(ClearRank512(ranks, highPair), lowPair))
+                    + Vector512.Create((long)WinHandType.TWO_PAIR << 32), result);
+            result = Vector512.ConditionalSelect(NonZero512(three),
+                (trip << 12) + TopRanks512(ClearRank512(ranks, trip), 2)
+                    + Vector512.Create((long)WinHandType.THREE_OF_A_KIND << 32), result);
+            result = Vector512.ConditionalSelect(Vector512.GreaterThanOrEqual(straight, Vector512<long>.Zero),
+                straight + Vector512.Create((long)WinHandType.STRAIGHT << 32), result);
+            result = Vector512.ConditionalSelect(NonZero512(flush),
+                TopRanks512(flush, 5) + Vector512.Create((long)WinHandType.FLUSH << 32), result);
+            result = Vector512.ConditionalSelect(NonZero512(three) & NonZero512(fullHousePairs),
+                (trip << 6) + TopRank512(fullHousePairs) + Vector512.Create((long)WinHandType.FULL_HOUSE << 32), result);
+            result = Vector512.ConditionalSelect(NonZero512(four),
+                (quad << 6) + TopRank512(ClearRank512(ranks, quad)) + Vector512.Create((long)WinHandType.QUAD << 32), result);
+            result = Vector512.ConditionalSelect(Vector512.GreaterThanOrEqual(straightFlush, Vector512<long>.Zero),
+                straightFlush + Vector512.Create((long)WinHandType.STRAIGHT_FLUSH << 32), result);
+            return result;
         }
 
         // Combine the ordering value and WinHandType from EvalHand 
