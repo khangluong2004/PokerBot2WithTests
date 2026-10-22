@@ -177,12 +177,9 @@ namespace PokerBot2
                         history.Add(EncodeHistoryBetState(agents[curPlayer].GetId(), totalBet[curPlayer], 0, 0));
                     }
 
-                    // Putting the whole stack in with a call/raise is also all-in
-                    if (bet != Game.FOLD_VALUE && bet != Game.ALL_IN_VALUE && agents[curPlayer].GetStack() <= 0)
-                    {
-                        isAllIn[curPlayer] = totalBet[curPlayer];
-                        numAllIn++;
-                    }
+                    // Agents must declare ALL_IN_VALUE when betting their whole stack (no runtime check, for speed)
+                    Debug.Assert(bet == Game.FOLD_VALUE || bet == Game.ALL_IN_VALUE || agents[curPlayer].GetStack() > 0,
+                        "Betting the whole stack must be declared as all-in");
                     canRaise[curPlayer] = false;
                 }
 

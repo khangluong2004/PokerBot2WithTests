@@ -55,8 +55,9 @@ namespace PokerBot2.Agents
             if (bet == -1)
             {
                 bet = Game.FOLD_VALUE;
-            } else if (bet == -2)
+            } else if (bet == -2 || bet == stack)
             {
+                // Betting the whole stack must be declared as all-in
                 bet = Game.ALL_IN_VALUE;
             } else
             {
