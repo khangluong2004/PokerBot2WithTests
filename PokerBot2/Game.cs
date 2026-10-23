@@ -50,7 +50,7 @@ namespace PokerBot2
             string display = "";
             if (rank <= 8)
             {
-                display = "" + ('1' + rank);
+                display = "" + (char) ('1' + rank);
             }
             else
             {
@@ -77,16 +77,20 @@ namespace PokerBot2
         public static int StringToCard(string card)
         {
             int rank;
-            switch (card[0])
+            int index = 0;
+            switch (card[index])
             {
                 case 'J': rank = 9; break;
                 case 'Q': rank = 10; break;
                 case 'K': rank = 11; break;
                 case 'A': rank = 12; break;
-                default: rank = card[0] - '2'; break;
+                case '1': rank = 10; index++; break;
+                default: rank = card[index] - '2'; break;
             }
 
-            var suit = card[1] switch
+            index++;
+
+            var suit = card[index] switch
             {
                 '♠' => 0,
                 '♣' => 1,

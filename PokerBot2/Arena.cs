@@ -355,19 +355,21 @@ namespace PokerBot2
             int activePlayers = numPlayer;
             int numAllIn = 0;
 
+            double smallBlindAmount = Math.Min(agents[smallBlind].GetStack(), Game.SMALL_BLIND);
+            double bigBlindAmount = Math.Min(agents[bigBlind].GetStack(), Game.BIG_BLIND);
 
             Span<int> board = stackalloc int[5];
-            double pot = Game.SMALL_BLIND + Game.BIG_BLIND;
+            double pot = smallBlindAmount + bigBlindAmount;
             int isFinished = -1;
 
             // PRE-FLOP
             // Blinds: agents manage their own stack, so the blinds are charged as negative return
-            agents[smallBlind].ReceiveReturn(-Game.SMALL_BLIND);
-            agents[bigBlind].ReceiveReturn(-Game.BIG_BLIND);
-            totalBet[smallBlind] = Game.SMALL_BLIND;
-            totalBet[bigBlind] = Game.BIG_BLIND;
-            history.Add(EncodeHistoryBetState(agents[smallBlind].GetId(), Game.SMALL_BLIND, 0, 0));
-            history.Add(EncodeHistoryBetState(agents[bigBlind].GetId(), Game.BIG_BLIND, 0, 0));
+            agents[smallBlind].ReceiveReturn(-smallBlindAmount);
+            agents[bigBlind].ReceiveReturn(-bigBlindAmount);
+            totalBet[smallBlind] = smallBlindAmount;
+            totalBet[bigBlind] = bigBlindAmount;
+            history.Add(EncodeHistoryBetState(agents[smallBlind].GetId(), smallBlindAmount, 0, 0));
+            history.Add(EncodeHistoryBetState(agents[bigBlind].GetId(), bigBlindAmount, 0, 0));
 
             // Bet
             (pot, activePlayers, numAllIn, isFinished) = RoundBet(ref isFold, ref isAllIn, ref entitledPot, ref totalBet, ref handBet, ref board, 
