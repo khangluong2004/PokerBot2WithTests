@@ -217,11 +217,11 @@ namespace PokerBot2UnitTests
             });
         }
 
-        [Test]
-        // Random legal play never creates or destroys chips, for any table size.
-        public void RoundPlay_ShouldConserveChips_WithRandomPlay([Range(2, 9)] int numPlayer)
+        // Plays seeded random hands (seeded agents and deck), asserting chips are conserved after every hand.
+        // Debug.Assert failures inside the arena also fail the test.
+        private static void PlayRandomHands(int seed, int numPlayer, int hands)
         {
-            var random = new Random(numPlayer);
+            var random = new Random(seed);
             var agents = Agents(numPlayer);
             foreach (var agent in agents)
             {
@@ -245,9 +245,9 @@ namespace PokerBot2UnitTests
                     return CallPolicy(a, toCall, minRaise);
                 };
             }
-            var arena = new Arena(numPlayer, [.. agents]);
+            var arena = new Arena(numPlayer, [.. agents], seed);
 
-            for (int hand = 0; hand < 2000; hand++)
+            for (int hand = 0; hand < hands; hand++)
             {
                 // Reset the whole table once someone busts, so stacks stay within the 15-bit history encoding
                 if (agents.Any(a => a.Stack < Game.BIG_BLIND))
@@ -261,6 +261,85 @@ namespace PokerBot2UnitTests
                 Assert.That(agents.Sum(a => a.Stack), Is.EqualTo(total).Within(1e-6), $"Hand {hand}");
                 Assert.That(agents.All(a => a.Stack >= 0), $"Hand {hand}");
             }
+        }
+
+        [Test]
+        // Random legal play never creates or destroys chips, for any table size.
+        public void RoundPlay_ShouldConserveChips_WithRandomPlay([Range(2, 9)] int numPlayer)
+        {
+            PlayRandomHands(numPlayer, numPlayer, 2000);
+        }
+
+        // Regression: with fractional amounts (after split pots), an exact min raise toCall + minRaise could
+        // round 1 ulp below the min raise, and recomputing totalBet + toCall could make a call look like a raise.
+        // These seeds hit it before the fix (min raise assert failed).
+        [TestCase(5882, 4)]
+        [TestCase(14203, 5)]
+        public void RoundPlay_ShouldAcceptExactMinRaise_WithFractionalAmounts(int seed, int numPlayer)
+        {
+            PlayRandomHands(seed, numPlayer, 2000);
+        }
+
+        [Test]
+        // A player who can't cover the blind posts the whole stack and is all-in: never asked to act,
+        // and the others still bet on every street.
+        public void RoundPlay_ShouldPutShortBlindAllIn()
+        {
+            var agents = Agents(3);
+            var streetsActedOn = new HashSet<(int player, int numCard)>();
+            foreach (var agent in agents)
+            {
+                agent.Policy = (a, toCall, minRaise) =>
+                {
+                    streetsActedOn.Add((a.Id, a.NumCard));
+                    return CallPolicy(a, toCall, minRaise);
+                };
+            }
+            // Dealer is seat 0, so seat 1 posts the small blind with only 5 chips
+            agents[1].Stack = 5;
+            double total = agents.Sum(a => a.Stack);
+            var arena = new Arena(3, [.. agents]);
+
+            arena.RoundPlay();
+
+            var history = History(arena);
+            Assert.Multiple(() =>
+            {
+                Assert.That(streetsActedOn.Any(s => s.player == 1), Is.False, "All-in small blind was asked to act");
+                foreach (int numCard in new[] { 0, 3, 4, 5 })
+                {
+                    Assert.That(streetsActedOn, Does.Contain((0, numCard)));
+                    Assert.That(streetsActedOn, Does.Contain((2, numCard)));
+                }
+                // Small blind entry: id 1, bet 5, all-in flag
+                Assert.That(history[0], Is.EqualTo(Arena.EncodeHistoryBetState(1, 5, 0, 1)));
+                Assert.That(agents.Sum(a => a.Stack), Is.EqualTo(total));
+            });
+        }
+
+        [Test]
+        // The same seed deals the same cards, so the same agents play the same hands.
+        public void Arena_ShouldReplayHands_WithSameSeed()
+        {
+            List<int> Play(int seed)
+            {
+                var agents = Agents(4);
+                agents.ForEach(a => a.Policy = CallPolicy);
+                var arena = new Arena(4, [.. agents], seed);
+                var played = new List<int>();
+                for (int hand = 0; hand < 50; hand++)
+                {
+                    arena.RoundPlay();
+                    played.AddRange(History(arena));
+                }
+                return played;
+            }
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(Play(42), Is.EqualTo(Play(42)));
+                Assert.That(Play(42), Is.Not.EqualTo(Play(43)));
+            });
         }
     }
 }
