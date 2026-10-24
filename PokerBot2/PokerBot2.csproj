@@ -9,4 +9,19 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
+  <!-- Performance settings. Build and run with -c Release; see README "Build settings" for the measurements. -->
+  <PropertyGroup>
+    <!-- JIT (dotnet run / dotnet build): dynamic PGO devirtualizes the IAgent calls in the betting loop.
+         On by default since .NET 8, kept explicit so it isn't turned off by accident. -->
+    <TieredPGO>true</TieredPGO>
+    <!-- GC tuned for throughput. The engine allocates nothing per hand, so this only matters when agents allocate. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <!-- Native AOT (dotnet publish): compile for this machine's CPU (AVX-512, LZCNT, BMI...) instead of the
+         x86-64-v2 baseline. Without it the AVX-512 hand evaluator falls back to scalar code (4x slower).
+         The published binary then only runs on CPUs with the same instruction sets. -->
+    <IlcInstructionSet>native</IlcInstructionSet>
+    <OptimizationPreference>Speed</OptimizationPreference>
+  </PropertyGroup>
+
 </Project>
