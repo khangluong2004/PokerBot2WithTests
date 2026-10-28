@@ -196,6 +196,37 @@ namespace PokerBot2UnitTests
         }
 
         [Test]
+        // A 3-way tie whose seats are in the reverse order of their entitled pots: each side pot slice is split
+        // only among the tied players entitled to it, smallest stack first.
+        public void HandleShowdown_ShouldSplitTiesPerSidePot_WhenSeatsAreOutOfOrder()
+        {
+            var agents = Agents(4);
+            agents.ForEach(a => a.Stack = 0);
+            agents[0].Hole = (Game.StringToCard("2♠"), Game.StringToCard("3♦"));
+            agents[1].Hole = (Game.StringToCard("4♠"), Game.StringToCard("5♦"));
+            agents[2].Hole = (Game.StringToCard("6♠"), Game.StringToCard("7♦"));
+            agents[3].Hole = (Game.StringToCard("A♠"), Game.StringToCard("A♦"));
+            var arena = new Arena(4, [.. agents]);
+
+            // The board is a broadway straight, so seats 0-2 tie. Bets of 500, 300, 100, and 200 from the folded
+            // seat 3: entitled to 500 + 300 + 100 + 200, 300 + 300 + 100 + 200, 100 * 4 (and 700 for seat 3)
+            arena.HandleShowdown(Cards("10♣", "J♦", "Q♥", "K♠", "A♣"), [false, false, false, true], new double[4],
+                new double[] { 1100, 900, 400, 700 }, new double[] { 500, 300, 100, 200 }, 1100);
+
+            // 400 split 3 ways, the next 500 split between seats 0 and 1, the last 200 to seat 0
+            var history = History(arena);
+            Assert.Multiple(() =>
+            {
+                Assert.That(agents[2].Stack, Is.EqualTo(400.0 / 3).Within(1e-9));
+                Assert.That(agents[1].Stack, Is.EqualTo(400.0 / 3 + 250).Within(1e-9));
+                Assert.That(agents[0].Stack, Is.EqualTo(400.0 / 3 + 250 + 200).Within(1e-9));
+                Assert.That(agents[3].Stack, Is.EqualTo(0));
+                Assert.That(history.Skip(2).Select(h => (h & 0b1111, h >> 4)),
+                    Is.EqualTo(new[] { (0, 83), (1, 83), (2, 33), (3, -200) }));
+            });
+        }
+
+        [Test]
         // Chips put in by a player who folded still go to the winners, and a folded best hand wins nothing.
         public void HandleShowdown_ShouldAwardFoldedChips()
         {

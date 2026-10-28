@@ -1,6 +1,9 @@
 ﻿using PokerBot2.Agents;
 using System.Diagnostics;
+using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 namespace PokerBot2
 {
@@ -9,6 +12,9 @@ namespace PokerBot2
         public const int DEALER_HISTORY_STATE = 11;
         // Tolerance for comparing chip amounts, which can be fractional after split pots
         const double CHIP_EPSILON = 1e-9;
+        // Per-seat chip buffers are padded to 2 x Vector512<double>, so vector code can load them whole.
+        // Lanes past numPlayer stay 0
+        const int SEAT_LANES = 16;
 
         // Game structure: 10 small blind, 20 big blind, 2500 stack per player, up to 9 players
         readonly int numPlayer;
@@ -118,9 +124,10 @@ namespace PokerBot2
             var preAllInMaxBet = maxBet;
             Span<int> dealtBoard = board[..numCard];
 
-            // A player who already acted can only raise again once betting is re-opened by a full raise
-            Span<bool> canRaise = stackalloc bool[numPlayer];
-            canRaise.Fill(true);
+            // A player who already acted can only raise again once betting is re-opened by a full raise.
+            // Bit per seat: re-opening sets every bit in one instruction instead of filling a bool span
+            uint allSeats = (1u << numPlayer) - 1;
+            uint canRaise = allSeats;
             do
             {
                 if (activePlayers == 1)
@@ -136,7 +143,7 @@ namespace PokerBot2
                     // Exact chips needed to call, and the min raise on top of it (infinite if betting not re-opened)
                     toCall = maxBet - totalBet[curPlayer];
                     bet = agent.Play(history, dealtBoard, toCall,
-                        canRaise[curPlayer] ? prevRaise : double.PositiveInfinity);
+                        ((canRaise >> curPlayer) & 1) != 0 ? prevRaise : double.PositiveInfinity);
                     Debug.Assert(bet == Game.FOLD_VALUE || bet == Game.ALL_IN_VALUE || agent.GetStack() >= 0,
                         "Can't bet more than stack");
                     if (bet == Game.FOLD_VALUE)
@@ -165,13 +172,13 @@ namespace PokerBot2
                             {
                                 prevRaise = curRaise;
                                 preAllInMaxBet = totalBet[curPlayer];
-                                canRaise.Fill(true);
+                                canRaise = allSeats;
                             } else if (curRaiseBeforeAllIn >= prevRaise)
                             {
                                 // Re-open betting if multiple short all-in reaches above full raise
                                 // Min raise stays the same
                                 preAllInMaxBet = totalBet[curPlayer];
-                                canRaise.Fill(true);
+                                canRaise = allSeats;
                             }
 
                             maxBet = totalBet[curPlayer];
@@ -181,7 +188,7 @@ namespace PokerBot2
                     // a call 1 ulp above maxBet once amounts are fractional, and turn it into a raise
                     else if (bet > toCall)
                     {
-                        Debug.Assert(canRaise[curPlayer], "Betting not re-opened, can only call or fold");
+                        Debug.Assert(((canRaise >> curPlayer) & 1) != 0, "Betting not re-opened, can only call or fold");
                         // toCall + minRaise can round 1 ulp below the min raise with fractional amounts
                         Debug.Assert(bet - toCall >= prevRaise - CHIP_EPSILON, "Need to raise minimum prev raise");
                         pot += bet;
@@ -190,7 +197,7 @@ namespace PokerBot2
                         maxBet = totalBet[curPlayer];
                         preAllInMaxBet = maxBet;
                         actionPlayer = curPlayer;
-                        canRaise.Fill(true);
+                        canRaise = allSeats;
                         history.Add(EncodeHistoryBetState(ids[curPlayer], totalBet[curPlayer], 0, 0));
                     }
                     else
@@ -206,7 +213,7 @@ namespace PokerBot2
                     // Agents must declare ALL_IN_VALUE when betting their whole stack (no runtime check, for speed)
                     Debug.Assert(bet == Game.FOLD_VALUE || bet == Game.ALL_IN_VALUE || agent.GetStack() > 0,
                         "Betting the whole stack must be declared as all-in");
-                    canRaise[curPlayer] = false;
+                    canRaise &= ~(1u << curPlayer);
                 }
 
                 curPlayer = NextSeat(curPlayer);
@@ -224,9 +231,20 @@ namespace PokerBot2
                 }
             }
 
-            for (int i = 0; i < numPlayer; i++)
+            // 2 vector adds for all seats when the buffers are padded (as RoundPlay allocates them)
+            if (Vector512.IsHardwareAccelerated && handBet.Length >= SEAT_LANES && totalBet.Length >= SEAT_LANES)
             {
-                handBet[i] += totalBet[i];
+                ref double hand = ref MemoryMarshal.GetReference(handBet);
+                ref double round = ref MemoryMarshal.GetReference(totalBet);
+                (Vector512.LoadUnsafe(ref hand) + Vector512.LoadUnsafe(ref round)).StoreUnsafe(ref hand);
+                (Vector512.LoadUnsafe(ref hand, 8) + Vector512.LoadUnsafe(ref round, 8)).StoreUnsafe(ref hand, 8);
+            }
+            else
+            {
+                for (int i = 0; i < numPlayer; i++)
+                {
+                    handBet[i] += totalBet[i];
+                }
             }
 
             return (pot, activePlayers, numAllIn, winner);
@@ -246,6 +264,29 @@ namespace PokerBot2
 
             // Use the bets over the whole hand: summing per round is wrong once a player calls a fractional
             // all-in with its integer part, then bets more than the all-in player on a later round
+            if (Vector512.IsHardwareAccelerated)
+            {
+                // All seats at once: lane i adds min(handBet[i], handBet[j]) for each j, in the same order as the
+                // scalar loop, so the sums are identical. Padding lanes are 0 and stay 0 (min(0, x) = 0)
+                Debug.Assert(handBet.Length >= SEAT_LANES && entitledPot.Length >= SEAT_LANES);
+                ref double bets = ref MemoryMarshal.GetReference(handBet);
+                var betLo = Vector512.LoadUnsafe(ref bets);
+                var betHi = Vector512.LoadUnsafe(ref bets, 8);
+                var entitledLo = Vector512<double>.Zero;
+                var entitledHi = Vector512<double>.Zero;
+                for (int j = 0; j < numPlayer; j++)
+                {
+                    var bet = Vector512.Create(Unsafe.Add(ref bets, j));
+                    // vminpd: amounts are never NaN or -0, so the IEEE handling of Math.Min isn't needed
+                    entitledLo += Vector512.MinNative(betLo, bet);
+                    entitledHi += Vector512.MinNative(betHi, bet);
+                }
+                ref double dst = ref MemoryMarshal.GetReference(entitledPot);
+                entitledLo.StoreUnsafe(ref dst);
+                entitledHi.StoreUnsafe(ref dst, 8);
+                return;
+            }
+
             for (int i = 0; i < numPlayer; i++)
             {
                 double entitled = 0;
@@ -255,15 +296,6 @@ namespace PokerBot2
                 }
                 entitledPot[i] = entitled;
             }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static bool IsAfter((long evalValue, double negEntitledPot, int playerIndex) a,
-            (long evalValue, double negEntitledPot, int playerIndex) b)
-        {
-            if (a.evalValue != b.evalValue) return a.evalValue > b.evalValue;
-            if (a.negEntitledPot != b.negEntitledPot) return a.negEntitledPot > b.negEntitledPot;
-            return a.playerIndex > b.playerIndex;
         }
 
         public void HandleShowdown(Span<int> board,
@@ -276,98 +308,63 @@ namespace PokerBot2
             int finalPot = (int) pot;
             // PnL of each player: what they won minus what they bet over the hand
             Span<double> pnl = stackalloc double[numPlayer];
-            for (int i = 0; i < numPlayer; i++)
-            {
-                pnl[i] = -handBet[i];
-            }
 
             // Evaluate all players at once (AVX-512 batch when available) from the shared board mask
             ulong boardMask = Game.ToHandMask(board);
             Span<ulong> handMasks = stackalloc ulong[numPlayer];
             Span<long> evalValues = stackalloc long[numPlayer];
+            // Bit per seat still in the hand (not folded)
+            uint inHand = 0;
             int card1, card2;
             for (int i=0; i < numPlayer; i++)
             {
+                pnl[i] = -handBet[i];
                 (card1, card2) = agents[i].GetDealCard();
                 handMasks[i] = boardMask | Game.ToCardMask(card1) | Game.ToCardMask(card2);
+                inHand |= (isFold[i] ? 0u : 1u) << i;
             }
             Game.EvalHandValues(handMasks, evalValues);
 
-            Span<(long evalValue, double negEntitledPot, int playerIndex)> evalArr =
-                stackalloc (long evalValue, double negEntitledPot, int playerIndex)[numPlayer];
-
-            for (int i=0; i < numPlayer; i++)
+            // No sort: take the best hand still in, pay it, and only look further down for the side pots it isn't
+            // entitled to. Usually a single pass. Sorting all 9 hands cost about 80 ns of mispredicted branches.
+            // Entitled pot already paid out to better hands
+            double paidLevel = 0;
+            long best;
+            uint tie;
+            int seat;
+            // pot > CHIP_EPSILON to ignore any rounding errors, folded players never win
+            while (inHand != 0 && pot > CHIP_EPSILON)
             {
-                if (isFold[i])
+                // Iterate the set bits: tzcnt gives the lowest seat, seats & (seats - 1) clears it
+                best = -1;
+                for (uint seats = inHand; seats != 0; seats &= seats - 1)
                 {
-                    evalArr[i] = (-1, 0, i);
+                    best = Math.Max(best, evalValues[BitOperations.TrailingZeroCount(seats)]);
+                }
+                tie = 0;
+                for (uint seats = inHand; seats != 0; seats &= seats - 1)
+                {
+                    seat = BitOperations.TrailingZeroCount(seats);
+                    tie |= (evalValues[seat] == best ? 1u : 0u) << seat;
+                }
+                inHand &= ~tie;
+
+                // More than one bit set: split pot
+                if ((tie & (tie - 1)) != 0)
+                {
+                    pot = PaySplit(tie, entitledPot, pnl, pot, ref paidLevel);
                     continue;
                 }
-
-                evalArr[i] = (evalValues[i], -entitledPot[i],  i);
-            }
-
-            // Insertion sort, same order as the tuple's default comparison (evalValue, then negEntitledPot, then
-            // playerIndex). At most 9 items, and unlike Span.Sort it needs no comparer (which allocates under AOT)
-            for (int i = 1; i < numPlayer; i++)
-            {
-                var item = evalArr[i];
-                int j = i - 1;
-                while (j >= 0 && IsAfter(evalArr[j], item))
+                seat = BitOperations.TrailingZeroCount(tie);
+                double entitled = entitledPot[seat];
+                if (entitled > paidLevel)
                 {
-                    evalArr[j + 1] = evalArr[j];
-                    j--;
+                    double share = entitled - paidLevel;
+                    agents[seat].ReceiveReturn(share);
+                    pnl[seat] += share;
+                    pot -= share;
+                    paidLevel = entitled;
                 }
-                evalArr[j + 1] = item;
-            }
-            int counter = numPlayer - 1;
-            long curMaxEval;
-            int numMaxEval;
-            double entitledShare;
-            double entitled;
-            // Entitled pot already paid out to better hands, and the level paid out within the current tie
-            double paidLevel = 0;
-            double tieLevel;
-            // pot > CHIP_EPSILON to ignore any rounding errors, folded players (evalValue = -1) never win
-            while (counter >= 0 && pot > CHIP_EPSILON && evalArr[counter].evalValue >= 0)
-            {
-                curMaxEval = evalArr[counter].evalValue;
-                numMaxEval = 1;
-
-                // Find out how many ties
-                counter--;
-                while (counter >= 0 && evalArr[counter].evalValue == curMaxEval)
-                {
-                    numMaxEval++;
-                    counter--;
-                }
-
-                // Resolve the ties: going down the tie, entitled pot goes up (sorted by negEntitledPot).
-                // Each side pot slice above what was already paid is split among the tied players entitled to it.
-                counter += numMaxEval;
-                entitledShare = 0;
-                tieLevel = paidLevel;
-                for (int i = 0; i < numMaxEval; i++)
-                {
-                    // IMPORTANT: This engine doesn't give a fuck about odd chips, since too complicated for no
-                    // reason. So we'll allow fractional betting and stack size.
-                    entitled = -evalArr[counter].negEntitledPot;
-                    if (entitled > tieLevel)
-                    {
-                        entitledShare += (entitled - tieLevel) / (numMaxEval - i);
-                        tieLevel = entitled;
-                    }
-                    if (entitledShare > 0)
-                    {
-                        agents[evalArr[counter].playerIndex].ReceiveReturn(
-                            entitledShare
-                        );
-                        pnl[evalArr[counter].playerIndex] += entitledShare;
-                    }
-                    counter--;
-                }
-                pot -= tieLevel - paidLevel;
-                paidLevel = tieLevel;
             }
 
             history.Add(EncodeHistoryShowdownBoard(board));
@@ -376,6 +373,50 @@ namespace PokerBot2
             {
                 history.Add(EncodeHistoryShowdownPnL(ids[i], pnl[i]));
             }
+        }
+
+        // Tied best hands (bit per seat in tie). Going through them by increasing entitled pot, each side pot slice
+        // above what was already paid is split among the tied players entitled to it. Returns the pot left
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private double PaySplit(uint tie, Span<double> entitledPot, Span<double> pnl, double pot, ref double paidLevel)
+        {
+            // Insertion sort of the tied seats by entitled pot (at most 9)
+            Span<int> order = stackalloc int[numPlayer];
+            int numTie = 0;
+            for (uint seats = tie; seats != 0; seats &= seats - 1)
+            {
+                int seat = BitOperations.TrailingZeroCount(seats);
+                int j = numTie++ - 1;
+                while (j >= 0 && entitledPot[order[j]] > entitledPot[seat])
+                {
+                    order[j + 1] = order[j];
+                    j--;
+                }
+                order[j + 1] = seat;
+            }
+
+            double entitledShare = 0;
+            double tieLevel = paidLevel;
+            double entitled;
+            for (int i = 0; i < numTie; i++)
+            {
+                // IMPORTANT: This engine doesn't give a fuck about odd chips, since too complicated for no
+                // reason. So we'll allow fractional betting and stack size.
+                entitled = entitledPot[order[i]];
+                if (entitled > tieLevel)
+                {
+                    entitledShare += (entitled - tieLevel) / (numTie - i);
+                    tieLevel = entitled;
+                }
+                if (entitledShare > 0)
+                {
+                    agents[order[i]].ReceiveReturn(entitledShare);
+                    pnl[order[i]] += entitledShare;
+                }
+            }
+            pot -= tieLevel - paidLevel;
+            paidLevel = tieLevel;
+            return pot;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -406,9 +447,10 @@ namespace PokerBot2
 
             Span<bool> isFold = stackalloc bool[numPlayer];
             Span<double> isAllIn = stackalloc double[numPlayer]; // Stored the all-in amount
-            Span<double> entitledPot = stackalloc double[numPlayer]; // Stored the pot entitled by each player
-            Span<double> totalBet = stackalloc double[numPlayer]; // Stored the bet of each player in the current round
-            Span<double> handBet = stackalloc double[numPlayer]; // Stored the bet of each player over the whole hand
+            // Chip buffers padded to SEAT_LANES for the vector code
+            Span<double> entitledPot = stackalloc double[SEAT_LANES]; // Stored the pot entitled by each player
+            Span<double> totalBet = stackalloc double[SEAT_LANES]; // Stored the bet of each player in the current round
+            Span<double> handBet = stackalloc double[SEAT_LANES]; // Stored the bet of each player over the whole hand
             int activePlayers = numPlayer;
             int numAllIn = 0;
 
