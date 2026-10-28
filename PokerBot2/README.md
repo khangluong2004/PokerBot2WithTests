@@ -191,15 +191,32 @@ dotnet test PokerBot2UnitTests --filter "FullyQualifiedName~AllSevenCardHands"
 
 ## Arena implementation notes
 
-**Zero allocations per hand**, under both the JIT and Native AOT. Everything per hand lives in `stackalloc` spans (at most 9 entries), and the history list keeps its capacity across hands.
+**Zero allocations per hand**, under both the JIT and Native AOT. Everything per hand lives in `stackalloc` spans (one entry per seat, with the chip buffers padded to 16 for AVX-512), and the history list keeps its capacity across hands.
 
 What the betting loop avoids, and why:
 - **No integer division**: the next seat is `seat + 1 == numPlayer ? 0 : seat + 1` instead of `(seat + 1) % numPlayer`. A division is 10+ cycles, and the loop moves to the next seat on every action.
 - **No interface calls for bookkeeping**: agents are kept in an `IAgent[]` and the history in a `List<int>` (not `IList<>`), and player ids are cached in an `int[]`. Only the real agent calls (`Play`, `AllIn`, `ReceiveDealCard`, `GetDealCard`, `ReceiveReturn`) go through the interface.
 - **Spans passed by value** to `RoundBet` (not `ref Span`), so the JIT can keep their pointers and lengths in registers.
 - **Side-pot entitlement computed once**, just before the showdown. It used to be recomputed after every betting round, which is a 9×9 loop once anyone is all-in, even for hands that end early.
-- **Insertion sort at showdown**: at most 9 hands to rank, and `Span.Sort` on tuples allocated 48 B per showdown under Native AOT (its default comparer).
+- **No sort at showdown**: the payout takes the best hand still in (a scan over a bit-per-seat mask), pays it, and only looks further down for the side pots that hand isn't entitled to. That's usually a single pass. The insertion sort of all hands it replaces cost about 80 ns per 9-player showdown, mostly mispredicted branches. Ties go to `PaySplit`, which orders only the tied seats by entitled pot. (`Span.Sort` was never an option: its default comparer allocated 48 B per showdown under Native AOT.)
+- **`canRaise` is a bitmask** (bit per seat): re-opening the betting sets every bit in one instruction instead of filling a `bool` span, and that span's `stackalloc` is gone.
 - `DEALER_HISTORY_STATE` is a `const`, so it folds into the code.
+
+### SIMD
+
+Most of a hand can't be vectorized. The betting loop is sequential: each action depends on the previous agent's decision. Dealing and the agent calls are sequential too. The parts that are data-parallel over the seats (at most 9) use AVX-512 when `Vector512.IsHardwareAccelerated`:
+
+| Where | What | Time, scalar → vector (9 players) |
+|---|---|---|
+| `Game.EvalHandValues` | All players' hands at showdown, 8 per instruction | See [Hand evaluation](#hand-evaluation) |
+| `ComputeEntitledPot` | Side-pot entitlement Σⱼ min(bet[i], bet[j]) for every seat at once: per seat j, 2 × `vminpd` + 2 × `vaddpd` | 20 → 2 ns per showdown with an all-in |
+| End of `RoundBet` | `handBet += totalBet` for every seat: 2 vector adds | 4 → 0.7 ns per street |
+
+Tried and not kept:
+- **Vector best-hand search at showdown** (`vpmaxsq` reduction, `vpcmpeqq` for the ties): no faster than the scalar bitmask scan in whole-hand benchmarks, and slower heads-up. With at most 9 seats, the shuffles of the horizontal max cost about as much as the scalar loop. It only won (50 → 34 ns) in a contrived test where every player had a different all-in amount.
+- **Writing the showdown history with one `CollectionsMarshal.SetCount`** instead of a `List.Add` per entry: within noise.
+
+The vector code does the same additions in the same order as the scalar code, so the results are identical. 1.28M seeded hands replay bit for bit against the previous version, with and without AVX-512. Without AVX-512, or on CPUs where .NET leaves 512-bit vectors off by default, the scalar loops run. To test that path on an AVX-512 machine, set `DOTNET_PreferredVectorBitWidth=256`, or `DOTNET_EnableAVX512=0` to turn AVX-512 off completely. (`DOTNET_EnableAVX512F=0` does nothing in .NET 10.)
 
 ### Floating point
 
@@ -230,16 +247,16 @@ dotnet publish PokerBot2 -c Release -r win-x64      # Native AOT
 
 Runtime settings (`TieredPGO`, GC) belong to the application. If training runs from a separate project that references PokerBot2, put them in that project's `.csproj`. Native AOT needs the Visual Studio "Desktop development with C++" workload. If the link step fails with `'vswhere.exe' is not recognized`, add `C:\Program Files (x86)\Microsoft Visual Studio\Installer` to `PATH` or publish from a Developer PowerShell.
 
-Measured on a Ryzen 9 9900X, Release, single thread, 1M hands per run, best run out of 3 processes × 5 runs (single process for "before"). The numbers include the agents' own work. "Always call" sends every hand to showdown; "mixed" folds 25%, raises 15% and goes all-in 3% of the time.
+Measured on a Ryzen 9 9900X, Release, single thread, 1M hands per run, best run out of 3 processes × 5 runs (single process for "original"). The numbers include the agents' own work. "Always call" sends every hand to showdown; "mixed" folds 25%, raises 15% and goes all-in 3% of the time. The 2026-10-24 columns were re-measured next to the current code, so they differ slightly from the numbers first published that day.
 
-| Agents | Players | Before (ns/hand) | JIT now | Native AOT now |
-|---|---|---|---|---|
-| Always call | 2 | 315 | 149 | 170 |
-| Always call | 6 | 583 | 336 | 374 |
-| Always call | 9 | 758 | 468 | 503 |
-| Mixed | 2 | 294 | 134 | 145 |
-| Mixed | 6 | 785 | 543 | 548 |
-| Mixed | 9 | 1,175 | 757 | 780 |
+| Agents | Players | Original (ns/hand) | 2026-10-24, JIT | 2026-10-24, AOT | Now, JIT | Now, Native AOT |
+|---|---|---|---|---|---|---|
+| Always call | 2 | 315 | 162 | 169 | 141 | 160 |
+| Always call | 6 | 583 | 373 | 368 | 287 | 327 |
+| Always call | 9 | 758 | 498 | 495 | 341 | 425 |
+| Mixed | 2 | 294 | 148 | 145 | 139 | 137 |
+| Mixed | 6 | 785 | 563 | 549 | 488 | 479 |
+| Mixed | 9 | 1,175 | 788 | 779 | 655 | 640 |
 
 | Hand evaluator (ns/hand) | JIT | Native AOT, default CPU | Native AOT, `IlcInstructionSet=native` |
 |---|---|---|---|
@@ -247,10 +264,10 @@ Measured on a Ryzen 9 9900X, Release, single thread, 1M hands per run, best run 
 | `EvalHandValues` (batch) | 2.4 | 9.8 (no AVX-512) | 2.2 |
 
 What the measurements say:
-- **The JIT is the fastest way to run the Arena**, about 1–14% ahead of Native AOT (AOT can't devirtualize the agent calls, or the call into `System.Random`). Prefer `dotnet run -c Release` for training. Native AOT is a close second and starts instantly.
+- **The JIT is the safer choice for training**: 12–20% ahead of Native AOT with always-call agents (AOT can't devirtualize the agent calls, or the call into `System.Random`), and within 2% with mixed agents, where AOT is slightly ahead. Prefer `dotnet run -c Release` for training. Native AOT starts instantly.
 - **Train unseeded** when throughput matters (`new Arena(numPlayer, agents)`): a seeded `Random` uses the slower legacy algorithm and costs about 5–8% per hand with these benchmark agents.
 - **Native AOT without `IlcInstructionSet=native` loses AVX-512 and LZCNT**, and the batch evaluator gets 4x slower. That's why the setting is on.
-- With a single agent type, the JIT knobs are within noise. 9 players, always call / mixed (ns/hand): default 459 / 777, `DOTNET_TieredPGO=0` 459 / 781, `DOTNET_TieredCompilation=0` 469 / 763, Server GC 460 / 773.
+- With a single agent type, the JIT knobs are within noise. 9 players, always call / mixed (ns/hand, 2026-10-24 code): default 459 / 777, `DOTNET_TieredPGO=0` 459 / 781, `DOTNET_TieredCompilation=0` 469 / 763, Server GC 460 / 773.
 - **Not enabled on purpose**: `SkipLocalsInit` showed no measurable gain (the `stackalloc` buffers are at most 9 entries), and the code relies on them starting at zero. Disabling tiered compilation gave no gain and turns off dynamic PGO.
 
 ## Known limitations
@@ -261,6 +278,17 @@ What the measurements say:
 - `IAgent.Reset(playerId, position)` is never called by the arena.
 
 ## Changelog
+
+### 2026-10-25
+
+Performance: 13–32% less time per hand at 6–9 players under the JIT (11–18% under Native AOT), and 5–12% heads-up (see the tables above). Results are unchanged, hand for hand.
+- Showdown pays out by scanning for the best hand still in, instead of sorting every hand first. This is the biggest gain (see [Arena implementation notes](#arena-implementation-notes)).
+- AVX-512 for the side-pot entitlement and for adding each round's bets to the hand totals (see [SIMD](#simd)). Scalar fallbacks run without AVX-512.
+- `canRaise` in `RoundBet` is a bit-per-seat mask instead of a `bool` span.
+- The per-seat chip buffers in `RoundPlay` are padded to 16 entries for the vector code.
+
+Tests (53 run by default):
+- `HandleShowdown_ShouldSplitTiesPerSidePot_WhenSeatsAreOutOfOrder`: a 3-way tie whose seats are in the reverse order of their entitled pots, so the tied seats must be reordered before the split.
 
 ### 2026-10-24
 
