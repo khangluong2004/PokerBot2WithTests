@@ -415,10 +415,14 @@ namespace PokerBot2
             // count <= 13 per lane, so count + 11 is in 11-24, and has bit 4 (16) set exactly when count >= 5.
             // Shift bit 4 down to bit 0: 1 in the lane of the flush suit, 0 in the others
             var isFlushSuit = ((count + Vector512.Create(0x000B000B000B000BUL)) >> 4) & Vector512.Create(0x0001000100010001UL);
-            // Turn each lane's 1 into 0xFFFF: (1 << 16) - 1 per lane. Lanes are 0 or 1, so no borrow crosses lanes.
+            // Turn the flush lane's 1 into 0xFFFF: the shift moves the 1 up into the next lane, and subtracting the
+            // original 1 borrows it back, leaving 0xFFFF in the flush lane and 0 above. For hearts (the top lane) the
+            // shifted 1 falls off bit 63 and the borrow wraps around mod 2^64, which gives the same 0xFFFF << 48.
             // Then keep only the flush suit's lane of the hand
             var flushBits = hand & ((isFlushSuit << 16) - isFlushSuit);
-            // Fold the 4 lanes into the low 13 bits: only the flush lane is non-zero, so this is its rank mask
+            // Fold the 4 lanes into the low 13 bits: only the flush lane is non-zero, so this is its rank mask.
+            // The shorter shifts leave copies in the lanes between (TopRanks512 would read them as ranks 16 and up),
+            // so keep only the low lane
             var flush = (flushBits | (flushBits >> 16) | (flushBits >> 32) | (flushBits >> 48)) & rankBits;
 
             var quad = TopRank512(four);
