@@ -386,7 +386,7 @@ namespace PokerBot2
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector512<long> EvalHandValues512(Vector512<ulong> hand)
         {
-            var rankBits = Vector512.Create(0x1FFFUL);
+            var rankBits = Vector512.Create(0x1FFFUL); // Each suit uses 13 bits in the 16-bit lane to store rank
             var spade = hand & rankBits;
             var club = (hand >> 16) & rankBits;
             var diamond = (hand >> 32) & rankBits;
