@@ -152,7 +152,7 @@ namespace PokerBot2UnitTests
 
             var board = Cards("2♣", "7♦", "9♥", "J♠", "K♣");
             // Bets of 100, 500, 500: entitled to 100 * 3 and 100 + 500 + 500
-            arena.HandleShowdown(board, new bool[3], new double[3], new double[] { 300, 1100, 1100 }, new double[] { 100, 500, 500 }, 1100);
+            arena.HandleShowdown(board, new bool[3], new double[] { 300, 1100, 1100 }, new double[] { 100, 500, 500 }, 1100);
 
             var history = History(arena);
             Assert.Multiple(() =>
@@ -185,7 +185,7 @@ namespace PokerBot2UnitTests
             var arena = new Arena(3, [.. agents]);
 
             // Bets of 100, 500, 500: entitled to 100 * 3 and 100 + 500 + 500
-            arena.HandleShowdown(Cards("2♣", "7♦", "9♥", "J♠", "K♣"), new bool[3], new double[3], new double[] { 300, 1100, 1100 }, new double[] { 100, 500, 500 }, 1100);
+            arena.HandleShowdown(Cards("2♣", "7♦", "9♥", "J♠", "K♣"), new bool[3], new double[] { 300, 1100, 1100 }, new double[] { 100, 500, 500 }, 1100);
 
             Assert.Multiple(() =>
             {
@@ -210,7 +210,7 @@ namespace PokerBot2UnitTests
 
             // The board is a broadway straight, so seats 0-2 tie. Bets of 500, 300, 100, and 200 from the folded
             // seat 3: entitled to 500 + 300 + 100 + 200, 300 + 300 + 100 + 200, 100 * 4 (and 700 for seat 3)
-            arena.HandleShowdown(Cards("10♣", "J♦", "Q♥", "K♠", "A♣"), [false, false, false, true], new double[4],
+            arena.HandleShowdown(Cards("10♣", "J♦", "Q♥", "K♠", "A♣"), [false, false, false, true],
                 new double[] { 1100, 900, 400, 700 }, new double[] { 500, 300, 100, 200 }, 1100);
 
             // 400 split 3 ways, the next 500 split between seats 0 and 1, the last 200 to seat 0
@@ -238,7 +238,7 @@ namespace PokerBot2UnitTests
             var arena = new Arena(3, [.. agents]);
 
             // Bets of 100, 200, and 150 from the folded player: entitled to 100 * 3 and 100 + 200 + 150
-            arena.HandleShowdown(Cards("2♣", "7♦", "9♥", "J♠", "K♣"), [false, false, true], new double[3], new double[] { 300, 450, 450 }, new double[] { 100, 200, 150 }, 450);
+            arena.HandleShowdown(Cards("2♣", "7♦", "9♥", "J♠", "K♣"), [false, false, true], new double[] { 300, 450, 450 }, new double[] { 100, 200, 150 }, 450);
 
             Assert.Multiple(() =>
             {

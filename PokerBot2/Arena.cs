@@ -300,7 +300,6 @@ namespace PokerBot2
 
         public void HandleShowdown(Span<int> board,
             Span<bool> isFold,
-            Span<double> isAllIn,
             Span<double> entitledPot,
             Span<double> handBet,
             double pot)
@@ -309,10 +308,10 @@ namespace PokerBot2
             // PnL of each player: what they won minus what they bet over the hand
             Span<double> pnl = stackalloc double[numPlayer];
 
-            // Evaluate all players at once (AVX-512 batch when available) from the shared board mask
-            ulong boardMask = Game.ToHandMask(board);
-            Span<ulong> handMasks = stackalloc ulong[numPlayer];
-            Span<long> evalValues = stackalloc long[numPlayer];
+            // Table-based evaluation (Game.EvalHandRank). The board's key and mask (one vector) are computed once, and
+            // each player only adds their 2 hole cards
+            var boardKeyMask = Game.HandKeyMask(board);
+            Span<int> handRanks = stackalloc int[numPlayer];
             // Bit per seat still in the hand (not folded)
             uint inHand = 0;
             int card1, card2;
@@ -320,16 +319,15 @@ namespace PokerBot2
             {
                 pnl[i] = -handBet[i];
                 (card1, card2) = agents[i].GetDealCard();
-                handMasks[i] = boardMask | Game.ToCardMask(card1) | Game.ToCardMask(card2);
+                handRanks[i] = Game.EvalHandRank(boardKeyMask + Game.HandKeyMask(card1) + Game.HandKeyMask(card2));
                 inHand |= (isFold[i] ? 0u : 1u) << i;
             }
-            Game.EvalHandValues(handMasks, evalValues);
 
             // No sort: take the best hand still in, pay it, and only look further down for the side pots it isn't
             // entitled to. Usually a single pass. Sorting all 9 hands cost about 80 ns of mispredicted branches.
             // Entitled pot already paid out to better hands
             double paidLevel = 0;
-            long best;
+            int best;
             uint tie;
             int seat;
             // pot > CHIP_EPSILON to ignore any rounding errors, folded players never win
@@ -339,13 +337,13 @@ namespace PokerBot2
                 best = -1;
                 for (uint seats = inHand; seats != 0; seats &= seats - 1)
                 {
-                    best = Math.Max(best, evalValues[BitOperations.TrailingZeroCount(seats)]);
+                    best = Math.Max(best, handRanks[BitOperations.TrailingZeroCount(seats)]);
                 }
                 tie = 0;
                 for (uint seats = inHand; seats != 0; seats &= seats - 1)
                 {
                     seat = BitOperations.TrailingZeroCount(seats);
-                    tie |= (evalValues[seat] == best ? 1u : 0u) << seat;
+                    tie |= (handRanks[seat] == best ? 1u : 0u) << seat;
                 }
                 inHand &= ~tie;
 
@@ -545,7 +543,7 @@ namespace PokerBot2
             }
 
             ComputeEntitledPot(entitledPot, handBet, pot, numAllIn);
-            HandleShowdown(board, isFold, isAllIn, entitledPot, handBet, pot);
+            HandleShowdown(board, isFold, entitledPot, handBet, pot);
             dealer = NextSeat(dealer);
         }
     }

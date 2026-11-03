@@ -2,11 +2,12 @@
 
 A fast No-Limit Texas Hold'em engine for training poker bots in house. It deals hands, runs the betting with agents that plug in through `IAgent`, settles side pots, and records a compact integer history for each hand.
 
-- `Game.cs`: card encoding, dealing, hand evaluation (scalar and AVX-512 batch).
+- `Game.cs`: card encoding, dealing, hand evaluation (table-based `EvalHandRank`, plus the bit-operation evaluator in scalar and AVX-512 batch form).
 - `Arena.cs`: table, betting rounds, side pots, showdown, history encoding.
 - `Agents/IAgent.cs`: the agent contract. `Agents/HumanPlayer.cs` is a console agent.
 - `PokerBot2.csproj`: build settings for speed (see [Build settings and performance](#build-settings-and-performance)).
 - `../PokerBot2UnitTests`: NUnit tests (`dotnet test`).
+- `../EvaluatorBench`: benchmark against other hand evaluators (see [Comparison with other evaluators](#comparison-with-other-evaluators)).
 
 ## Game rules
 
@@ -100,6 +101,10 @@ The hand-written generator made whole hands 2–6% faster unseeded and 6–8% fa
 
 ## Hand evaluation
 
+There are two evaluators, and they rank hands in exactly the same order:
+- **`EvalHandRank`**, table-based, for exactly 7 cards. It returns a single `int`. It's the fastest while its tables are in cache, and it's what `Arena` uses at showdown. See [Table-based evaluator](#table-based-evaluator-evalhandrank).
+- **`EvalHand` / `EvalHandValue`**, computed with bit operations and no tables, for 1 to 7 cards (fillers allowed). `EvalHandValues` evaluates many hands at once with AVX-512. These read no memory, so they win once something else has pushed `EvalHandRank`'s tables out of the cache (see [When the tables aren't in cache](#when-the-tables-arent-in-cache)). `EvalHandValue` is also the source of truth that `EvalHandRank`'s tables are built from. The rest of this section describes it.
+
 ### Hand mask: 16 bits per suit
 
 Hands are evaluated from a `ulong` mask with **one 16-bit lane per suit**, and one bit per rank in each lane:
@@ -155,27 +160,240 @@ With fillers (fewer than 5 real cards) a missing kicker is rank `-1`, so values 
 |---|---|
 | `EvalHand(Span<int> cards, int numFiller)` | 7 cards (fillers allowed). Doesn't modify the input. Kept for compatibility |
 | `EvalHand(ulong handMask)` | Same result from a mask |
-| `EvalHandValue(ulong handMask)` | `ToEvalValue(EvalHand(mask))` without the tuple |
-| `EvalHandValues(ReadOnlySpan<ulong>, Span<long>)` | Batch. Uses AVX-512 (8 hands per instruction, branch-free) when supported, scalar otherwise. Used by `Arena.HandleShowdown` |
+| `EvalHandValue(ulong handMask)` | `ToEvalValue(EvalHand(mask))` without the tuple. Reads no memory: the fastest for 1 or 2 hands when `EvalHandRank`'s tables aren't in cache |
+| `EvalHandValues(ReadOnlySpan<ulong>, Span<long>)` | Batch. Uses AVX-512 (8 hands per instruction, branch-free) when supported, scalar otherwise. Reads no memory: the fastest for many hands at once when the tables have been evicted to DRAM |
+| `HandKeyMask(int card)`, `HandKeyMask(ReadOnlySpan<int> cards)` | A card's (or the cards') key and mask in one `Vector128<ulong>`, for `EvalHandRank`. Add them up: `HandKeyMask(board) + HandKeyMask(c1) + HandKeyMask(c2)`. `HandKeyMask([])` is the empty hand |
+| `EvalHandRank(Vector128<ulong> keyMask)` | **Fastest** while its tables are in cache, exactly 7 cards. Single `int` rank, higher wins, equal = split pot. Used by `Arena.HandleShowdown` |
+| `HandRankType(int handRank)` | The `WinHandType` of a rank (`rank >> 12`) |
 
-Single thread on a Ryzen 9 9900X (Zen 5), random 7-card hands:
+Single thread on a Ryzen 9 9900X (Zen 5), random 7-card hands (the [comparison](#comparison-with-other-evaluators) has the method):
 
 | Evaluator | ns/hand |
 |---|---|
 | Original sort-based `EvalHand` | 84.4 |
 | `EvalHand(int[])` | 11.5 |
-| `EvalHandValue(ulong)` | 8.3 |
-| `EvalHandValues` (AVX-512) | 2.3 |
+| `EvalHandValue(ulong)` | 8.4 |
+| `EvalHandValues` (AVX-512 batch) | 2.3 |
+| `EvalHandRank(HandKeyMask(...))`, from the 7 cards | 2.3 |
+| `EvalHandRank(keyMask)`, vector given | 1.3 |
+
+### Table-based evaluator (`EvalHandRank`)
+
+**Result.** A single `int`: `(WinHandType << 12) | position among the hands of that type`. Higher wins and equal is a split pot, exactly like `EvalHandValue` (the tables are built from it). `HandRankType(rank)` gives the type back. The ranks aren't consecutive across types, so compare them but don't use them as array indices.
+
+**Key.** Every card has a 64-bit key, and a hand's key is the sum of its cards' keys:
+
+```
+bits 0-31   sum of RANK_KEYS[rank]      RANK_KEYS = 0, 1, 5, 22, 98, 453, 2031, 8698, 22854, 83661, 262349, 636345, 1479181
+bits 32-47  4-bit counter per suit     EMPTY_HAND_KEY starts each counter at 3
+```
+
+**Why suit counts are enough.** Apart from a flush or a straight flush, a hand's value depends only on its ranks; which suit each card is in doesn't matter. So the key keeps all the ranks (as the rank sum), but for the suits only how many cards each one has. The counts tell whether there's a flush, and in which suit. Only then does the evaluator need to know which ranks are in that suit, and it reads them from the hand mask.
+
+- **Rank sum.** The rank keys make the sum different for every multiset of 7 ranks (at most 4 of each), so the sum identifies the hand unless it's a flush. They come from a greedy search: each key is the smallest one above the previous key that keeps the sums unique (see [How `RANK_KEYS` were found](#how-rank_keys-were-found)). The largest sum is 7,825,759.
+- **Suit counters.** A suit with 5 or more cards takes its counter from 3 to 8–10, which sets the counter's bit 3. So `key & 0x8888 << 32` is the flush check, and `tzcnt` of it gives the flush suit. A counter never goes above 3 + 7 = 10, so it doesn't carry into the next one.
+
+**Lookup.**
+- **Flush**: `Flush[13-bit rank mask of the flush suit]`, 8,192 entries.
+- **Anything else**: `Ranks[rankSum + RowOffsets[rankSum >> 10]]`. This is a perfect hash by displacement: the sum's high bits pick a row, and each row has its own offset, chosen when the table is built so that the 49,205 rank multisets of 7 cards all get different slots. That's 2 dependent loads. Two smaller layouts were measured and not kept, because they're slower; see [Shrinking the rank table](#shrinking-the-rank-table).
+
+**Tables**: `Ranks` 113,407 × 2 B (222 KB), `RowOffsets` 7,643 × 4 B (30 KB), `Flush` 16 KB, and the 52 card vectors. They're built on first use, in about 75 ms, by evaluating one hand of every rank multiset and every flush with `EvalHandValue`. They fit in the L2 cache (1 MB per core here). An agent with a big working set of its own can push them out; see [When the tables aren't in cache](#when-the-tables-arent-in-cache).
+
+**Key and mask in one vector.** `HandKeyMask(card)` holds the key and the card mask in one `Vector128<ulong>`. The cards of a hand are all different, so adding their masks is the same as OR-ing them, and one `vpaddq` per card builds both. The mask is only read for a flush.
+
+**Showdown.** The board's key and mask are computed once, and each player only adds their 2 hole cards: `EvalHandRank(board + HandKeyMask(c1) + HandKeyMask(c2))`.
+
+**Credits.** The technique is not new. The rank keys are the ones [SKPokerEval](https://github.com/kennethshackleton/SKPokerEval) uses (found again by the same greedy search, see [How `RANK_KEYS` were found](#how-rank_keys-were-found)). The suit counters that start at 3, the 128-bit key + mask add, and the row-offset perfect hash are [OMPEval](https://github.com/zekyll/OMPEval)'s. The code and the tables here are PokerBot2's own.
+
+**Limits.** Exactly 7 cards (checked by `Debug.Assert` only). For 5 or 6 cards, use `EvalHand`/`EvalHandValue`. Cards must be 0–51: the card table is bounds-checked, so a bad card throws instead of reading memory past the table. Removing that check measured about 5% faster, and wasn't kept.
+
+#### How `RANK_KEYS` were found
+
+**What the keys must do.** The rank sum `Σ count[r] × RANK_KEYS[r]` must be different for each of the 49,205 multisets of 7 ranks with at most 4 of each rank. Only then does the sum alone identify a non-flush hand.
+
+**The search** goes through the ranks from the deuce up to the ace. For each rank, it picks the smallest key above the previous one that keeps the sums apart.
+
+To test a candidate key `k`, it keeps `partial[t]`: the sums of every partial hand of `t` cards, over the ranks done so far. Adding `c` cards of the new rank turns a sum `s` from `partial[t − c]` into `s + c·k`. Two partial hands with the same card count `t` clash when `s1 + c1·k == s2 + c2·k`, that is, when `s1 − s2 == (c2 − c1)·k`. The first `k` without a clash is kept.
+
+```csharp
+// partial[t]: the sums of all partial hands of t cards over the ranks done so far (unique within each t).
+// Rank 0 (the deuce) has key 0: 0-4 deuces all sum to 0, one partial hand per card count
+var partial = new List<int>[8];
+for (int t = 0; t <= 7; t++) partial[t] = t <= 4 ? [0] : [];
+int[] keys = new int[13];
+for (int rank = 1; rank < 13; rank++)
+{
+    var lookup = partial.Select(sums => sums.ToHashSet()).ToArray();
+    for (int k = keys[rank - 1] + 1; ; k++)
+    {
+        // Clash: two t-card hands with c1 < c2 cards of this rank and the same sum, s1 + c1*k == s2 + c2*k
+        bool clash = false;
+        for (int t = 0; t <= 7 && !clash; t++)
+            for (int c1 = 0; c1 <= Math.Min(4, t) && !clash; c1++)
+                for (int c2 = c1 + 1; c2 <= Math.Min(4, t) && !clash; c2++)
+                    foreach (int s2 in partial[t - c2])
+                        if (lookup[t - c1].Contains(s2 + (c2 - c1) * k)) { clash = true; break; }
+        if (clash) continue;
+
+        // Keep k, and extend every partial hand with 0-4 cards of this rank
+        keys[rank] = k;
+        var next = new List<int>[8];
+        for (int t = 0; t <= 7; t++)
+        {
+            next[t] = [];
+            for (int c = 0; c <= Math.Min(4, t); c++)
+                foreach (int s in partial[t - c]) next[t].Add(s + c * k);
+        }
+        partial = next;
+        break;
+    }
+}
+// keys = 0, 1, 5, 22, 98, 453, 2031, 8698, 22854, 83661, 262349, 636345, 1479181 (about 30 s)
+// partial[7]: 49,205 sums, all different, the largest 7,825,759
+```
+
+Why it's built this way:
+- **Only hands with the same number of cards must differ.** Two 7-card hands that agree on the higher ranks have the same number of cards left for the lower ranks. So partial sums only have to be unique within each card count. Sums for different counts may be equal, since a lookup always has exactly 7 cards. This is what keeps the keys small.
+- **The deuce gets key 0.** With exactly 7 cards, its count is 7 minus the other ranks' counts, so it adds nothing to identify the hand.
+- **The smallest keys keep the table small.** The largest sum, 4 × 1,479,181 + 3 × 636,345 = 7,825,759, fits in 23 bits. The perfect hash's row table therefore has only 7,643 entries (30 KB).
+
+The search runs once, offline: `RankTables.RANK_KEYS` holds its result as constants. The keys are the same as [SKPokerEval](https://github.com/kennethshackleton/SKPokerEval)'s. The exhaustive test would catch a clash: two clashing hands would share a table slot, so one of them would get the wrong rank.
+
+### Shrinking the rank table
+
+The 49,205 non-flush rank multisets of 7 cards have only 3,537 different values: hands with the same 5 best ranks are worth the same, whatever the other 2 cards. So the rank table doesn't strictly need a slot per multiset. Two ways to use that were measured. Neither was kept: lookup speed matters more than the memory.
+
+**Sharing slots in the perfect hash.** Letting a rank sum reuse a slot that already holds the same rank saves almost nothing. A row keeps its sums at fixed distances from each other, so two rows can only overlap where the ranks happen to match at every shared slot. Smaller rows share more, but then the table of row offsets grows:
+
+| Sums per row | `Ranks` entries, fast search, no sharing | `Ranks` entries, exhaustive search, sharing | Row offsets | Total, no sharing → sharing |
+|---|---|---|---|---|
+| 1,024 (used) | 113,407 | 109,660 | 30 KB | 251 → 244 KB |
+| 256 | 73,984 | 70,618 | 119 KB | 264 → 257 KB |
+| 64 | 55,019 | 45,413 | 478 KB | 585 → 566 KB |
+| 16 | 49,205 | 29,211 | 1.9 MB | 2.0 → 1.9 MB |
+
+The exhaustive search also takes 0.2–0.4 s to build. The fast search (10–40 ms) finds almost no sharing: 113,179 entries at 1,024 sums per row.
+
+**An XOR table.** Each rank sum hashes to 3 slots, one in each third of the table, and its rank is the XOR of those 3 entries. No slot belongs to a single hand, and there are no row offsets. The table needs about 1.23 slots per rank multiset: 60,546 slots, 118 KB.
+
+Building it: think of the slots as vertices and each rank sum as an edge joining its 3 slots. Repeatedly take a slot used by only one remaining rank sum, and set that rank sum aside. When all of them have been set aside, go through them in reverse order. Each rank sum's own slot is set last among its 3, to whatever makes its XOR come out right. This took 30 ms with the first seed; with 1.20 or 1.15 slots per multiset, no seed worked.
+
+The hash is one multiply. Three 21-bit slices of the product are each scaled to the size of a third.
+
+**Why it wasn't kept.** It halves the memory, but each lookup costs a multiply and a third load. Its 3 loads don't depend on each other, unlike the perfect hash's 2, so it's faster once the tables are out of cache. It's slower while they're in cache, which is when evaluation is a real share of the hand (JIT; cold numbers are the average of 2–3 runs):
+
+| | Perfect hash (used) | XOR table (not kept) |
+|---|---|---|
+| Rank table | 251 KB (`Ranks` 222 KB + row offsets 30 KB) | **118 KB** |
+| All `EvalHandRank` tables | 270 KB | **135 KB** |
+| Build, on first use | 75 ms | **30 ms** |
+| Random 7-card hands, from the cards | **2.3 ns** | 3.5 ns |
+| Heads-up showdown, hot | **12.5 ns** | 13.9 ns |
+| 9-player showdown, hot | **28.5 ns** | 36.7 ns |
+| Heads-up showdown, tables in L3 | 57 ns | **45 ns** |
+| Heads-up showdown, tables in DRAM, code warm | 269 ns | **170 ns** |
+| Heads-up showdown, everything in DRAM | 427 ns | **283 ns** |
+| Whole hand, heads-up, always call / mixed | **129 / 126 ns** | 133 / 129 ns |
+| Whole hand, 9 players, always call / mixed | **315 / 612 ns** | 329 / 640 ns |
+
+### When the tables aren't in cache
+
+`EvalHandRank` reads 2–3 tables in a chain: card vector, then row offset, then rank. If an agent's own work between hands has pushed those tables out of the cache, each read waits on L3 or DRAM. `EvalHandValue` and `EvalHandValues` read no memory, only their code. `EvaluatorBench`'s `cold` mode measures one showdown at a time, evaluated like `Arena.HandleShowdown`, after one of 4 cache states:
+- **hot**: nothing evicted;
+- **L2 evicted**: a 4 MB buffer read first, which pushes everything out of the 1 MB L2 into the L3;
+- **all evicted**: a 64 MB buffer read first, twice this core's 32 MB L3, so tables and code come from DRAM;
+- **tables cold, code warm**: the same, then one evaluation of another showdown to bring the code back.
+
+ns per showdown, after subtracting the cost of an empty call:
+
+| Evaluator | Hot | L2 evicted | All evicted | Tables cold, code warm |
+|---|---|---|---|---|
+| **Heads-up** `EvalHandRank` | **12** | 58 | 447 | 227 |
+| Heads-up `EvalHandValue` per player | 26 | **38** | **175** | **64** |
+| Heads-up `EvalHandValues` (AVX-512 batch) | 30 | 45 | 261 | 73 |
+| **9 players** `EvalHandRank` | **29** | **82** | 385 | 245 |
+| 9 players `EvalHandValue` per player | 90 | 121 | **375** | 136 |
+| 9 players `EvalHandValues` (AVX-512 batch) | 45 | 100 | 699 | **98** |
+
+Repeated runs vary by about ±15–20% in the evicted columns. What it means:
+- **Hot, `EvalHandRank` wins**: about 2x heads-up, 1.6x at 9 players.
+- **Once the tables have dropped to L3**, heads-up `EvalHandValue` is already faster. At 9 players `EvalHandRank` still wins.
+- **Once they're in DRAM**, `EvalHandValue` (2 hands) or `EvalHandValues` (many hands) is 2.5–3.5x faster while their code is still cached: the table lookups become 2–3 dependent DRAM misses.
+- **When everything is cold, code included**, `EvalHandValue` still wins heads-up (2.6x) but only ties at 9 players. The AVX-512 batch loses there, because its own code is bigger.
+
+**Why the Arena stays on `EvalHandRank`.** The tables only go cold when the agents' own work between showdowns touches megabytes of memory. That work costs microseconds to milliseconds per hand, against at most about 0.2–0.4 µs lost on evaluation. When the agents are light and evaluation is a real share of the hand, the tables stay hot, and `EvalHandRank` is the faster one.
+
+**When to use the others.** Inside an agent's own memory-heavy code, for example between neural network evaluations, `EvalHandValue` is the better choice for 1 or 2 hands, and `EvalHandValues` for a batch. Both are also the only option for 5 or 6 cards.
+
+**Removed, since nothing needed them**: `EvalHandRank(ulong handKey, ulong handMask)`, `HandKey(...)`, and the mask-only `EvalHandRank(ulong handMask)`.
+- The vector API does the same job faster: 2.3 ns from the 7 cards, against 3.9 ns with separate key and mask.
+- The mask-only overload needed its own 32 KB table, and was never faster for card input.
+- Code that only has a mask can use `EvalHandValue`, which needs no tables.
 
 ### Correctness
 
-`EvalHandReferenceTest` checks the evaluator against an independent reference: the best of the 21 five-card subsets, scored the textbook way. Two exhaustive tests are marked `[Explicit]` because they take about a minute:
+`EvalHandReferenceTest` checks `EvalHand` against an independent reference: the best of the 21 five-card subsets, scored the textbook way. `GameEvalHandRankTest` checks that `EvalHandRank` orders hands exactly like `EvalHandValue`: equal values get equal ranks, higher values strictly higher ranks, with the same hand type. It covers 1M random hands (and checks that the vector carries the hand's mask), every 5, 6 and 7-card flush of every suit, and how the Arena adds up the board and hole-card vectors.
+
+Three exhaustive tests are marked `[Explicit]` because they take about 10 s together:
 - every one of the 133,784,560 seven-card hands ranks like the reference, with exactly 4,824 distinct values;
-- the AVX-512 batch equals the scalar result on every hand.
+- the AVX-512 batch equals the scalar result on every hand;
+- `EvalHandRank` orders every hand like `EvalHandValue`.
 
 ```bash
 dotnet test PokerBot2UnitTests --filter "FullyQualifiedName~AllSevenCardHands"
 ```
+
+## Comparison with other evaluators
+
+PokerBot2's evaluators against 5 published ones on the same 2,000,000 random 7-card hands, one thread, Ryzen 9 9900X (Zen 5), Windows 11. The code and how to rerun it are in [EvaluatorBench](../EvaluatorBench/README.md).
+
+**Method.**
+- Each evaluator gets its own card format, prepared before timing (a relabeling of the 52 cards). Building the hand from its 7 cards is inside the timed loop, so every row from cards does the same job.
+- The C# evaluators run on .NET 10.0.13 (JIT). The C/C++ ones are built with both MSVC 19.51 (`/O2 /GL /arch:AVX512`) and GCC 14.2 (`-O3 -march=native`). Each is timed as the best of 7 passes after 2 warm-up passes.
+- **Correctness.** Before timing, every evaluator's result on all 2M hands is checked against `EvalHandRank`. Equal ranks must get equal results, and better ranks strictly better results (4,809 distinct strengths appear in the sample). All of them pass.
+
+| Evaluator | Language | Method | Memory | ns/hand | M hands/s |
+|---|---|---|---|---|---|
+| **PokerBot2 `EvalHandRank`** | C# | Rank-key sum + perfect hash, flush table | 270 KB | **2.28** | 439 |
+| [OMPEval](https://github.com/zekyll/OMPEval) | C++ | Rank-key sum + perfect hash, flush table | 220 KB | **1.60** GCC, 2.33 MSVC | 626 |
+| PokerBot2 `EvalHandValues` (AVX-512 batch, masks given) | C# | Bit operations, 8 hands per instruction | none | 2.32 | 430 |
+| PokerBot2 `EvalHandValue` (mask given) | C# | Bit operations | none | 8.4 | 119 |
+| [PokerHandEvaluator](https://github.com/HenryRLee/PokerHandEvaluator) (phevaluator) | C | Suit hash + base-5 rank hash | 125 KB | 12.4 MSVC, 14.7 GCC | 81 |
+| [Two Plus Two](https://github.com/tangentforks/TwoPlusTwoHandEvaluator) | C | 7-step state machine | 130 MB | 21.5 GCC, 29.9 MSVC | 47 |
+| [Senzee 7-card index](https://senzee.blogspot.com/2007/01/7.html) | C++ | Perfect index of the 52-bit mask + full table | 267 MB | 28.8 MSVC, 29.3 GCC | 35 |
+| [poker.net](https://github.com/JBelthoff/poker.net) | C# | Cactus Kev 5-card, best of 21 | 50 KB | 91.0 | 11 |
+
+M hands/s is for the fastest build.
+
+What the numbers say:
+- **The two small-table evaluators win by a wide margin.** OMPEval and `EvalHandRank` use the same technique (see [Credits](#table-based-evaluator-evalhandrank)). OMPEval built with GCC takes 30% less time than `EvalHandRank` under the .NET JIT (1.60 vs 2.28 ns); built with MSVC, the two are even (2.33 ns). The JIT's loop does two things the C++ one doesn't:
+  - it reloads each table's address from its static field, since an array on the GC heap can move;
+  - it bounds-checks the card table. Removing that check alone gained about 5%.
+
+  With the hand's vector already built, `EvalHandRank`'s lookup alone is 1.3 ns.
+- **The big tables lose on random hands.** Two Plus Two and Senzee read 130–267 MB tables, so a random hand is a cache miss, or several for Two Plus Two's 7 dependent steps. Two Plus Two is famous for enumerating all hands in order, where consecutive hands share their first 6 lookups and the table stays in cache. That's not how hands come at a showdown.
+- **The old bit-operation evaluator** (`EvalHandValue`) needs no memory at all. Its AVX-512 batch matches `EvalHandRank` when there are many hands to evaluate together, but not for the 2 hands of a heads-up showdown.
+- **Not included**: [palmistry3](https://github.com/felixubl/palmistry3), a fast table-free evaluator with the same 4 × 16-bit suit layout as `EvalHand`. Its flush test needs arm64 NEON, so it doesn't build on x86 without rewriting it.
+
+The evaluators:
+
+- **OMPEval**: Timo A. (zekyll), C++, ISC license, measured at commit `4aec210` (2016).
+  - A hand is a 128-bit value: a rank-key sum with suit counters, and the card mask. It's built with SSE adds.
+  - Flushes are found by the suit counters (starting at 3) and looked up in an 8,192-entry table. Other hands go through a row-offset perfect hash into an 86,547-entry `uint16` table (173 KB) with 32 KB of offsets.
+  - It evaluates 0 to 7 cards, and it also includes an equity calculator.
+- **PokerHandEvaluator (phevaluator)**: Henry Lee, C/C++ with Python bindings, Apache-2.0, commit `10be452` (2026).
+  - A suit hash finds flushes, which are looked up by the flush suit's 13-bit mask.
+  - Other hands are hashed from their rank counts in base 5 (`hash_quinary`, a loop over the 13 ranks with a DP table) into a 49,205-entry table.
+  - Rank 1 is the best hand (7,462 classes, Cactus Kev's numbering). Omaha is also supported.
+- **Two Plus Two**: Ray Wotton and the Two Plus Two forum (2006), C, via the tangentforks fork of XPokerEval, commit `f324fd8`. The license is unclear: the code says "My code is GPL, use it as you like".
+  - A 32,487,834-entry `int` table (130 MB) is a finite-state machine: each card is one lookup, and the 7th lookup returns the hand rank.
+  - The table comes from its own generator (4 s), which builds it with Cactus Kev's evaluator.
+- **Senzee 7-card index**: Paul Senzee (2007), C++ header `index52c7.h` from his blog, "(c) 2007", no license.
+  - `index52c7` maps any 52-bit mask with 7 bits set to a unique index 0–133,784,559, from the bit counts of its 4 × 16-bit chunks (512 KB of tables). One lookup in a 133,784,560-entry `uint16` table (267 MB) then gives the rank.
+  - The blog post says the table generator was lost, so the benchmark fills the table from OMPEval (0.6 s).
+- **poker.net**: John Belthoff, C# (.NET 10), MIT, commit `c00f7f4` (2025).
+  - It's a port of Cactus Kev's 5-card evaluator. Each card carries a prime per rank, and a non-flush 5-card hand is identified by the product of its primes, through Senzee's perfect hash. Flushes and straights are table lookups.
+  - A 7-card hand takes the best of its 21 five-card subsets, as in its `EvalEngine`.
 
 ## History encoding
 
@@ -199,6 +417,7 @@ What the betting loop avoids, and why:
 - **Spans passed by value** to `RoundBet` (not `ref Span`), so the JIT can keep their pointers and lengths in registers.
 - **Side-pot entitlement computed once**, just before the showdown. It used to be recomputed after every betting round, which is a 9×9 loop once anyone is all-in, even for hands that end early.
 - **No sort at showdown**: the payout takes the best hand still in (a scan over a bit-per-seat mask), pays it, and only looks further down for the side pots that hand isn't entitled to. That's usually a single pass. The insertion sort of all hands it replaces cost about 80 ns per 9-player showdown, mostly mispredicted branches. Ties go to `PaySplit`, which orders only the tied seats by entitled pot. (`Span.Sort` was never an option: its default comparer allocated 48 B per showdown under Native AOT.)
+- **Showdown hands are evaluated with `EvalHandRank`**: the board's key and mask (`HandKeyMask(board)`, one vector) are computed once, and each player adds 2 hole cards and does 1–2 table lookups. Heads-up this takes 12.5 ns instead of 24 ns, because the old AVX-512 batch only pays off for 8 hands at a time. See the [showdown numbers](#build-settings-and-performance), and [When the tables aren't in cache](#when-the-tables-arent-in-cache) for when it doesn't win.
 - **`canRaise` is a bitmask** (bit per seat): re-opening the betting sets every bit in one instruction instead of filling a `bool` span, and that span's `stackalloc` is gone.
 - `DEALER_HISTORY_STATE` is a `const`, so it folds into the code.
 
@@ -208,7 +427,7 @@ Most of a hand can't be vectorized. The betting loop is sequential: each action 
 
 | Where | What | Time, scalar → vector (9 players) |
 |---|---|---|
-| `Game.EvalHandValues` | All players' hands at showdown, 8 per instruction | See [Hand evaluation](#hand-evaluation) |
+| `Game.EvalHandValues` | Batch evaluation, 8 hands per instruction. The Arena no longer uses it: `EvalHandRank` is faster at 2 to 9 players while its tables are in cache | See [Hand evaluation](#hand-evaluation) |
 | `ComputeEntitledPot` | Side-pot entitlement Σⱼ min(bet[i], bet[j]) for every seat at once: per seat j, 2 × `vminpd` + 2 × `vaddpd` | 20 → 2 ns per showdown with an all-in |
 | End of `RoundBet` | `handBet += totalBet` for every seat: 2 vector adds | 4 → 0.7 ns per street |
 
@@ -247,37 +466,73 @@ dotnet publish PokerBot2 -c Release -r win-x64      # Native AOT
 
 Runtime settings (`TieredPGO`, GC) belong to the application. If training runs from a separate project that references PokerBot2, put them in that project's `.csproj`. Native AOT needs the Visual Studio "Desktop development with C++" workload. If the link step fails with `'vswhere.exe' is not recognized`, add `C:\Program Files (x86)\Microsoft Visual Studio\Installer` to `PATH` or publish from a Developer PowerShell.
 
-Measured on a Ryzen 9 9900X, Release, single thread, 1M hands per run, best run out of 3 processes × 5 runs (single process for "original"). The numbers include the agents' own work. "Always call" sends every hand to showdown; "mixed" folds 25%, raises 15% and goes all-in 3% of the time. The 2026-10-24 columns were re-measured next to the current code, so they differ slightly from the numbers first published that day.
+Measured on a Ryzen 9 9900X, Release, single thread, 1M hands per run, best run out of 3 processes × 5 runs (single process for "original"). The numbers include the agents' own work. "Always call" sends every hand to showdown; "mixed" folds 25%, raises 15% and goes all-in 3% of the time. Each dated column is the code of that day. The 2026-10-25 columns were re-measured next to the current code.
 
-| Agents | Players | Original (ns/hand) | 2026-10-24, JIT | 2026-10-24, AOT | Now, JIT | Now, Native AOT |
-|---|---|---|---|---|---|---|
-| Always call | 2 | 315 | 162 | 169 | 141 | 160 |
-| Always call | 6 | 583 | 373 | 368 | 287 | 327 |
-| Always call | 9 | 758 | 498 | 495 | 341 | 425 |
-| Mixed | 2 | 294 | 148 | 145 | 139 | 137 |
-| Mixed | 6 | 785 | 563 | 549 | 488 | 479 |
-| Mixed | 9 | 1,175 | 788 | 779 | 655 | 640 |
+| Agents | Players | Original (ns/hand) | 2026-10-24, JIT | 2026-10-25, JIT | 2026-10-25, AOT | Now, JIT | Now, Native AOT |
+|---|---|---|---|---|---|---|---|
+| Always call | 2 | 315 | 162 | 142 | 159 | **129** | 148 |
+| Always call | 6 | 583 | 373 | 286 | 336 | **231** | 290 |
+| Always call | 9 | 758 | 498 | 331 | 411 | **315** | 398 |
+| Mixed | 2 | 294 | 148 | 133 | 134 | 126 | **124** |
+| Mixed | 6 | 785 | 563 | 471 | 466 | 426 | **419** |
+| Mixed | 9 | 1,175 | 788 | 623 | 609 | 612 | **599** |
 
-| Hand evaluator (ns/hand) | JIT | Native AOT, default CPU | Native AOT, `IlcInstructionSet=native` |
+| Hand evaluator, random 7-card hands (ns/hand) | JIT | Native AOT, default CPU | Native AOT, `IlcInstructionSet=native` |
 |---|---|---|---|
-| `EvalHandValue` (scalar) | 8.5 | 9.7 | 8.4 |
-| `EvalHandValues` (batch) | 2.4 | 9.8 (no AVX-512) | 2.2 |
+| `EvalHandRank(HandKeyMask(...))`, from the 7 cards | 2.3 | 3.1 | 3.1 |
+| `EvalHandValue` (scalar, mask given) | 8.4 | 9.1 | 7.9 |
+| `EvalHandValues` (batch, masks given) | 2.3 | 9.2 (no AVX-512) | 2.1 |
+
+| Showdown evaluation, ns per showdown (JIT) | 2 players | 6 players | 9 players |
+|---|---|---|---|
+| Before: hand masks + `EvalHandValues` | 24.3 | 66.3 | 44.8 |
+| Now: `HandKeyMask(board)` once + `EvalHandRank` per player | **12.5** (1.9x) | **22.0** (3.0x) | **28.5** (1.6x) |
+
+The 6-player case gained the most because the old batch only vectorizes groups of 8 hands, so 6 players ran 6 scalar evaluations.
 
 What the measurements say:
-- **The JIT is the safer choice for training**: 12–20% ahead of Native AOT with always-call agents (AOT can't devirtualize the agent calls, or the call into `System.Random`), and within 2% with mixed agents, where AOT is slightly ahead. Prefer `dotnet run -c Release` for training. Native AOT starts instantly.
+- **The JIT is the safer choice for training**: 15–26% ahead of Native AOT with always-call agents (AOT can't devirtualize the agent calls, or the call into `System.Random`), and within 2% with mixed agents, where AOT is slightly ahead. Prefer `dotnet run -c Release` for training. Native AOT starts instantly.
 - **Train unseeded** when throughput matters (`new Arena(numPlayer, agents)`): a seeded `Random` uses the slower legacy algorithm and costs about 5–8% per hand with these benchmark agents.
-- **Native AOT without `IlcInstructionSet=native` loses AVX-512 and LZCNT**, and the batch evaluator gets 4x slower. That's why the setting is on.
+- **Native AOT without `IlcInstructionSet=native` loses AVX-512 and LZCNT**, and the batch evaluator gets 4x slower. That's why the setting is on. `EvalHandRank` doesn't need either, so it runs at the same speed with or without the setting. It is about 35% slower under Native AOT than under the JIT.
 - With a single agent type, the JIT knobs are within noise. 9 players, always call / mixed (ns/hand, 2026-10-24 code): default 459 / 777, `DOTNET_TieredPGO=0` 459 / 781, `DOTNET_TieredCompilation=0` 469 / 763, Server GC 460 / 773.
 - **Not enabled on purpose**: `SkipLocalsInit` showed no measurable gain (the `stackalloc` buffers are at most 9 entries), and the code relies on them starting at zero. Disabling tiered compilation gave no gain and turns off dynamic PGO.
 
 ## Known limitations
 
 - The bet field is 15 bits, so totals above 32,767 don't fit. The default table (at most 9 × 2,500 = 22,500 chips) is safe, but larger stacks are not.
+- `EvalHandRank` takes exactly 7 cards (5 board + 2 hole). For the flop or the turn, use `EvalHand` / `EvalHandValue`.
 - The history only keeps integer parts. Use `toCall` / `minRaise` for exact amounts.
 - Hands that end because everyone else folded don't write showdown entries.
 - `IAgent.Reset(playerId, position)` is never called by the arena.
 
 ## Changelog
+
+### 2026-11-01
+
+API changes:
+- `Arena.HandleShowdown` no longer takes `isAllIn`: it was never read, since the side pots come from the entitled pots.
+
+Benchmarks:
+- [When the tables aren't in cache](#when-the-tables-arent-in-cache): which evaluator wins once an agent's own work has evicted `EvalHandRank`'s tables (`EvaluatorBench`, `cold` mode). `EvalHandValue` and `EvalHandValues` stay for that case.
+
+Docs:
+- [How `RANK_KEYS` were found](#how-rank_keys-were-found), with the search code, and why the key only needs suit counts.
+- [Shrinking the rank table](#shrinking-the-rank-table): sharing slots and an XOR table were measured. The XOR table halves the memory but is slower while the tables are in cache, so the perfect hash stays.
+
+### 2026-10-30
+
+Features:
+- **`Game.EvalHandRank`**: a table-based 7-card evaluator that returns a single `int` rank, ordered exactly like `EvalHandValue`. It comes with `HandKeyMask` and `HandRankType`. See [Table-based evaluator](#table-based-evaluator-evalhandrank).
+
+Performance:
+- `Arena.HandleShowdown` uses `EvalHandRank`, with the board's key and mask computed once. Evaluating a showdown is 1.9x faster heads-up, 3.0x at 6 players and 1.6x at 9 players while the tables are in cache. Whole hands under the JIT are 5–9% faster heads-up, 10–19% at 6 players and 2–5% at 9 players (see the [tables](#build-settings-and-performance)). Results are unchanged, hand for hand.
+- On random 7-card hands, `EvalHandRank` takes 2.3 ns from the 7 cards, against 8.4 ns for `EvalHandValue`.
+
+Benchmarks:
+- [Comparison with other evaluators](#comparison-with-other-evaluators): OMPEval, PokerHandEvaluator, Two Plus Two, Senzee's 7-card index and poker.net, on the same hands. The code is in `EvaluatorBench/`.
+
+Tests (57 run by default, plus 3 explicit exhaustive ones):
+- `GameEvalHandRankTest`: `EvalHandRank` orders 1M random hands and every flush exactly like `EvalHandValue`, and the Arena-style board + hole-card vectors add up. An `[Explicit]` test checks all 133,784,560 hands.
 
 ### 2026-10-25
 

@@ -1,0 +1,13 @@
+# Third-party evaluators (git clones and downloads, see README.md)
+external/
+# Generated hands, reference ranks and the Two Plus Two table (HandRanks.dat, 130 MB)
+data/
+bin/
+obj/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.o
+NativeBench/obj_msvc/
+NativeBench/obj_gcc/
