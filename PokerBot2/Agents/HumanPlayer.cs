@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
+using PokerBot2.GameSpace;
 
 namespace PokerBot2.Agents
 {

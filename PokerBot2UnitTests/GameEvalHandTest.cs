@@ -1,4 +1,4 @@
-using PokerBot2;
+using PokerBot2.GameSpace;
 
 namespace PokerBot2UnitTests
 {

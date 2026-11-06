@@ -1,4 +1,4 @@
-using PokerBot2;
+using PokerBot2.GameSpace;
 using System.Runtime.Intrinsics;
 
 namespace PokerBot2UnitTests
