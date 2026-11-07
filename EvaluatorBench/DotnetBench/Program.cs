@@ -9,6 +9,8 @@ using poker.net.Services;
 //   bench        7-card evaluators on data\hands7.bin: PokerBot2 (EvalHandRank and EvalHandValue(s)) and poker.net
 //   showdown     PokerBot2 at a showdown: one board, 2 / 6 / 9 players, before (AVX-512 batch) vs now (EvalHandRank)
 //   cold         one showdown at a time, with the tables hot, evicted from L2, or evicted to DRAM (see ColdBench.cs)
+//   seq          hands in sequential order: all 7-card hands, and all hole-card pairs on fixed boards (see SeqBench.cs).
+//                Writes data\boards5.bin the first time, which the native seq mode reads
 string mode = args.Length > 0 ? args[0] : "bench";
 string dataDir = Path.Combine(FindBenchDir(), "data");
 Directory.CreateDirectory(dataDir);
@@ -26,6 +28,9 @@ switch (mode)
         break;
     case "cold":
         ColdBench.Run();
+        break;
+    case "seq":
+        SeqBench.Run(Path.Combine(dataDir, "boards5.bin"));
         break;
     case "showdown":
         foreach (int numPlayer in new[] { 2, 6, 9 })

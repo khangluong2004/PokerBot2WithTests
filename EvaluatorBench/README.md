@@ -34,6 +34,7 @@ dotnet run -c Release --project DotnetBench -- gen        # data/hands7.bin and 
 dotnet run -c Release --project DotnetBench -- bench      # .NET evaluators
 dotnet run -c Release --project DotnetBench -- showdown   # PokerBot2 at a 2 / 6 / 9-player showdown, old vs new
 dotnet run -c Release --project DotnetBench -- cold       # one showdown at a time, after evicting the caches
+dotnet run -c Release --project DotnetBench -- seq        # hands in sequential order (also writes data/boards5.bin)
 ```
 
 `cold` times single showdowns after evicting the caches: hot, after reading 4 MB (out of L2), after reading 64 MB (out of L3), or out of L3 and then the code warmed again. It takes about 40 s; see `DotnetBench/ColdBench.cs`.
@@ -44,6 +45,7 @@ Native side, Windows:
 NativeBench\build_msvc.cmd
 cd data && ..\NativeBench\generate_table.exe && cd ..
 NativeBench\bench_msvc.exe data
+NativeBench\bench_msvc.exe data seq
 ```
 
 `generate_table.exe` is Two Plus Two's own table generator. It writes `HandRanks.dat` (130 MB) into the current folder in about 4 s.
@@ -53,7 +55,10 @@ GCC (MSYS2 UCRT64, `pacman -S mingw-w64-ucrt-x86_64-gcc`):
 ```bash
 PATH="/c/msys64/ucrt64/bin:$PATH" NativeBench/build_gcc.sh
 NativeBench/bench_gcc.exe data
+NativeBench/bench_gcc.exe data seq
 ```
+
+`seq` evaluates hands in sequential order: all 133,784,560 hands with c0 < c1 < ... < c6, then every hole-card pair on each of the 20,000 boards in `data/boards5.bin`. Each evaluator reuses the work for the cards that didn't change, its own natural way. Run `DotnetBench seq` first: it writes `boards5.bin`, which the native side reads. The results are in [PokerBot2/README.md](../PokerBot2/README.md#hands-in-sequential-order).
 
 The Senzee table (267 MB) is filled by the native benchmark itself, from OMPEval, in under a second. The author's generator was lost.
 

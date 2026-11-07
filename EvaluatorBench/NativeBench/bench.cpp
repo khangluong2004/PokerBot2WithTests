@@ -56,9 +56,213 @@ static std::string OrderCheck(const std::vector<int32_t>& reference, const std::
     return buf;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Sequential order (bench_xxx.exe data seq), the same 2 cases as DotnetBench's seq mode (SeqBench.cs):
+// - all hands: every 7-card hand in order (c0 < c1 < ... < c6)
+// - boards: every hole-card pair (1,081) on each board of data\boards5.bin (written by DotnetBench seq), in order
+// Each evaluator reuses the work for the cards that didn't change, its own natural way. A first pass counts the hand
+// types (checked against the known totals, or against OMPEval on the boards), then the best of 2 timed passes.
+
+static const long long kAllHandTypes[10] = {0, 23294460, 58627800, 31433400, 6461620, 6180020, 4047644, 3473184, 224848, 41584};
+
+// Hand type 1 (high card) - 9 (straight flush) of a phevaluator rank (1 = best, Cactus Kev's 7,462 classes)
+static int PhevalType(int rank)
+{
+    return rank > 6185 ? 1 : rank > 3325 ? 2 : rank > 2467 ? 3 : rank > 1609 ? 4 : rank > 1599 ? 5
+         : rank > 322 ? 6 : rank > 166 ? 7 : rank > 10 ? 8 : 9;
+}
+
+// The cards not on the board, in order
+static int Remaining(const uint8_t* board, int* rest)
+{
+    uint64_t used = 0;
+    for (int i = 0; i < 5; i++) used |= 1ULL << board[i];
+    int n = 0;
+    for (int card = 0; card < 52; card++) if (!(used >> card & 1)) rest[n++] = card;
+    return n;
+}
+
+// Two Plus Two: one state per loop level, so the innermost loop does 1 lookup per hand, at consecutive entries
+template <class F> static void AllTwoPlusTwo(const int* HR, F&& f)
+{
+    for (int a = 0; a < 46; a++) { int ua = HR[53 + a + 1];
+    for (int b = a + 1; b < 47; b++) { int ub = HR[ua + b + 1];
+    for (int c = b + 1; c < 48; c++) { int uc = HR[ub + c + 1];
+    for (int d = c + 1; d < 49; d++) { int ud = HR[uc + d + 1];
+    for (int e = d + 1; e < 50; e++) { int ue = HR[ud + e + 1];
+    for (int k = e + 1; k < 51; k++) { int uk = HR[ue + k + 1];
+    for (int g = k + 1; g < 52; g++) f(HR[uk + g + 1]); } } } } } }
+}
+
+// OMPEval: one Hand per loop level, each the previous one plus a card
+template <class F> static void AllOmp(const omp::HandEvaluator& omp, const std::vector<omp::Hand>& cards, F&& f)
+{
+    for (int a = 0; a < 46; a++) { omp::Hand ha = omp::Hand::empty() + cards[a];
+    for (int b = a + 1; b < 47; b++) { omp::Hand hb = ha + cards[b];
+    for (int c = b + 1; c < 48; c++) { omp::Hand hc = hb + cards[c];
+    for (int d = c + 1; d < 49; d++) { omp::Hand hd = hc + cards[d];
+    for (int e = d + 1; e < 50; e++) { omp::Hand he = hd + cards[e];
+    for (int k = e + 1; k < 51; k++) { omp::Hand hk = he + cards[k];
+    for (int g = k + 1; g < 52; g++) f((int)omp.evaluate(hk + cards[g])); } } } } } }
+}
+
+// phevaluator has no incremental API: all 7 cards every time
+template <class F> static void AllPheval(F&& f)
+{
+    for (int a = 0; a < 46; a++)
+    for (int b = a + 1; b < 47; b++)
+    for (int c = b + 1; c < 48; c++)
+    for (int d = c + 1; d < 49; d++)
+    for (int e = d + 1; e < 50; e++)
+    for (int k = e + 1; k < 51; k++)
+    for (int g = k + 1; g < 52; g++) f(evaluate_7cards(a, b, c, d, e, k, g));
+}
+
+// Senzee: the card mask ORed at each loop level, then index52c7 and 1 table lookup per hand
+template <class F> static void AllSenzee(const uint16_t* table, F&& f)
+{
+    for (int a = 0; a < 46; a++) { uint64_t ma = 1ULL << a;
+    for (int b = a + 1; b < 47; b++) { uint64_t mb = ma | 1ULL << b;
+    for (int c = b + 1; c < 48; c++) { uint64_t mc = mb | 1ULL << c;
+    for (int d = c + 1; d < 49; d++) { uint64_t md = mc | 1ULL << d;
+    for (int e = d + 1; e < 50; e++) { uint64_t me = md | 1ULL << e;
+    for (int k = e + 1; k < 51; k++) { uint64_t mk = me | 1ULL << k;
+    for (int g = k + 1; g < 52; g++) f((int)table[index52c7(mk | 1ULL << g)]); } } } } } }
+}
+
+template <class F> static void BoardsTwoPlusTwo(const int* HR, const std::vector<uint8_t>& boards, F&& f)
+{
+    int rest[52];
+    for (size_t at = 0; at + 5 <= boards.size(); at += 5) {
+        const uint8_t* board = &boards[at];
+        int n = Remaining(board, rest);
+        int u = 53;
+        for (int i = 0; i < 5; i++) u = HR[u + board[i] + 1];
+        for (int i = 0; i < n - 1; i++) {
+            int u6 = HR[u + rest[i] + 1];
+            for (int j = i + 1; j < n; j++) f(HR[u6 + rest[j] + 1]);
+        }
+    }
+}
+
+template <class F> static void BoardsOmp(const omp::HandEvaluator& omp, const std::vector<omp::Hand>& cards, const std::vector<uint8_t>& boards, F&& f)
+{
+    int rest[52];
+    for (size_t at = 0; at + 5 <= boards.size(); at += 5) {
+        const uint8_t* board = &boards[at];
+        int n = Remaining(board, rest);
+        omp::Hand hb = omp::Hand::empty();
+        for (int i = 0; i < 5; i++) hb += cards[board[i]];
+        for (int i = 0; i < n - 1; i++) {
+            omp::Hand h6 = hb + cards[rest[i]];
+            for (int j = i + 1; j < n; j++) f((int)omp.evaluate(h6 + cards[rest[j]]));
+        }
+    }
+}
+
+template <class F> static void BoardsPheval(const std::vector<uint8_t>& boards, F&& f)
+{
+    int rest[52];
+    for (size_t at = 0; at + 5 <= boards.size(); at += 5) {
+        const uint8_t* b = &boards[at];
+        int n = Remaining(b, rest);
+        for (int i = 0; i < n - 1; i++)
+            for (int j = i + 1; j < n; j++) f(evaluate_7cards(b[0], b[1], b[2], b[3], b[4], rest[i], rest[j]));
+    }
+}
+
+template <class F> static void BoardsSenzee(const uint16_t* table, const std::vector<uint8_t>& boards, F&& f)
+{
+    int rest[52];
+    for (size_t at = 0; at + 5 <= boards.size(); at += 5) {
+        const uint8_t* board = &boards[at];
+        int n = Remaining(board, rest);
+        uint64_t mb = 0;
+        for (int i = 0; i < 5; i++) mb |= 1ULL << board[i];
+        for (int i = 0; i < n - 1; i++) {
+            uint64_t m6 = mb | 1ULL << rest[i];
+            for (int j = i + 1; j < n; j++) f((int)table[index52c7(m6 | 1ULL << rest[j])]);
+        }
+    }
+}
+
+// pass(consumer) runs the evaluator over all its hands, calling consumer(value) for each
+template <class Pass, class TypeOf>
+static void MeasureSeq(const char* name, long long numHands, Pass&& pass, TypeOf&& typeOf, const long long* known,
+                       std::vector<long long>& reference)
+{
+    std::vector<long long> counts(10);
+    pass([&](int v) { counts[typeOf(v)]++; });
+    std::string check;
+    if (known) {
+        check = std::equal(counts.begin(), counts.end(), known) ? "ok (known totals)" : "WRONG";
+    } else if (reference.empty()) {
+        reference = counts;
+        check = "reference (";
+        for (int t = 1; t < 10; t++) check += std::to_string(counts[t]) + (t < 9 ? " " : ")");
+    } else {
+        check = counts == reference ? "ok (= OMPEval)" : "WRONG";
+    }
+    double best = 1e30;
+    long long checksum = 0;
+    for (int r = 0; r < 2; r++) {
+        long long sum = 0;
+        auto start = std::chrono::steady_clock::now();
+        pass([&](int v) { sum += v; });
+        best = std::min(best, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / numHands);
+        checksum += sum;
+    }
+    std::printf("  %-62s %7.2f ns  %7.0f M/s  hand types %s  (checksum %lld)\n", name, best, 1000 / best, check.c_str(),
+                (long long)(checksum & 0xFFFF));
+}
+
+static int RunSequential(const std::string& dataDir)
+{
+    auto boards = ReadFile(dataDir + "\\boards5.bin");
+    auto hrBytes = ReadFile(dataDir + "\\HandRanks.dat");
+    const int* HR = reinterpret_cast<const int*>(hrBytes.data());
+    omp::HandEvaluator omp;
+    std::vector<omp::Hand> ompCards;
+    for (unsigned card = 0; card < 52; card++) ompCards.push_back(omp::Hand(card));
+    // Senzee's table, filled from OMPEval as in the random benchmark
+    std::vector<uint16_t> senzee(133784560);
+    for (int a = 0; a < 46; a++) for (int b = a + 1; b < 47; b++) for (int c = b + 1; c < 48; c++)
+    for (int d = c + 1; d < 49; d++) for (int e = d + 1; e < 50; e++) for (int k = e + 1; k < 51; k++)
+    for (int g = k + 1; g < 52; g++) {
+        uint64_t mask = (1ULL << a) | (1ULL << b) | (1ULL << c) | (1ULL << d) | (1ULL << e) | (1ULL << k) | (1ULL << g);
+        senzee[index52c7(mask)] = omp.evaluate(omp::Hand::empty() + ompCards[a] + ompCards[b] + ompCards[c]
+            + ompCards[d] + ompCards[e] + ompCards[k] + ompCards[g]);
+    }
+#if defined(_MSC_VER)
+    std::printf("MSVC %d\n", _MSC_VER);
+#else
+    std::printf("GCC %d.%d\n", __GNUC__, __GNUC_MINOR__);
+#endif
+    auto byShift = [](int v) { return v >> 12; };
+    std::vector<long long> unused, reference;
+
+    std::printf("All 133,784,560 hands in order, best of 2 passes, ns per hand\n");
+    const long long numAll = 133784560;
+    MeasureSeq("Two Plus Two (one state per loop level)", numAll, [&](auto&& f) { AllTwoPlusTwo(HR, f); }, byShift, kAllHandTypes, unused);
+    MeasureSeq("OMPEval (one Hand per loop level)", numAll, [&](auto&& f) { AllOmp(omp, ompCards, f); }, byShift, kAllHandTypes, unused);
+    MeasureSeq("PokerHandEvaluator (phevaluator), 7 cards each time", numAll, [&](auto&& f) { AllPheval(f); }, PhevalType, kAllHandTypes, unused);
+    MeasureSeq("Senzee index52c7 + 267 MB table (mask per loop level)", numAll, [&](auto&& f) { AllSenzee(senzee.data(), f); }, byShift, kAllHandTypes, unused);
+
+    long long numBoardHands = (long long)(boards.size() / 5) * 1081;
+    std::printf("\nEvery hole-card pair on %zu boards in order (1,081 per board), best of 2 passes, ns per hand\n", boards.size() / 5);
+    MeasureSeq("OMPEval (board Hand once, + 2 cards)", numBoardHands, [&](auto&& f) { BoardsOmp(omp, ompCards, boards, f); }, byShift, nullptr, reference);
+    MeasureSeq("Two Plus Two (board state once, + 2 lookups)", numBoardHands, [&](auto&& f) { BoardsTwoPlusTwo(HR, boards, f); }, byShift, nullptr, reference);
+    MeasureSeq("PokerHandEvaluator (phevaluator), 7 cards each time", numBoardHands, [&](auto&& f) { BoardsPheval(boards, f); }, PhevalType, nullptr, reference);
+    MeasureSeq("Senzee index52c7 + 267 MB table (board mask once)", numBoardHands, [&](auto&& f) { BoardsSenzee(senzee.data(), boards, f); }, byShift, nullptr, reference);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     std::string dataDir = argc > 1 ? argv[1] : "..\\data";
+    if (argc > 2 && std::string(argv[2]) == "seq") {
+        return RunSequential(dataDir);
+    }
     auto hands = ReadFile(dataDir + "\\hands7.bin");
     auto rankBytes = ReadFile(dataDir + "\\ranks7.bin");
     size_t numHands = hands.size() / 7;

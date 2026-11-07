@@ -1,4 +1,4 @@
-# PokerBot2
+   # PokerBot2
 
 A fast No-Limit Texas Hold'em engine for training poker bots in house. It deals hands, runs the betting with agents that plug in through `IAgent`, settles side pots, and records a compact integer history for each hand.
 
@@ -493,7 +493,7 @@ What the numbers say:
   - it bounds-checks the card table. Removing that check alone gained about 5%.
 
   With the hand's vector already built, `EvalHandRank`'s lookup alone is 1.3 ns.
-- **The big tables lose on random hands.** Two Plus Two and Senzee read 130–267 MB tables, so a random hand is a cache miss, or several for Two Plus Two's 7 dependent steps. Two Plus Two is famous for enumerating all hands in order, where consecutive hands share their first 6 lookups and the table stays in cache. That's not how hands come at a showdown.
+- **The big tables lose on random hands.** Two Plus Two and Senzee read 130–267 MB tables, so a random hand is a cache miss, or several for Two Plus Two's 7 dependent steps. Two Plus Two is famous for enumerating all hands in order, where consecutive hands share their first 6 lookups and the table stays in cache. That's not how hands come at a showdown, but it is how an equity calculation can walk them (see [Hands in sequential order](#hands-in-sequential-order)).
 - **The old bit-operation evaluator** (`EvalHandValue`) needs no memory at all. Its AVX-512 batch matches `EvalHandRank` when there are many hands to evaluate together, but not for the 2 hands of a heads-up showdown.
 - **Not included**: [palmistry3](https://github.com/felixubl/palmistry3), a fast table-free evaluator with the same 4 × 16-bit suit layout as `EvalHand`. Its flush test needs arm64 NEON, so it doesn't build on x86 without rewriting it.
 
@@ -516,6 +516,47 @@ The evaluators:
 - **poker.net**: John Belthoff, C# (.NET 10), MIT, commit `c00f7f4` (2025).
   - It's a port of Cactus Kev's 5-card evaluator. Each card carries a prime per rank, and a non-flush 5-card hand is identified by the product of its primes, through Senzee's perfect hash. Flushes and straights are table lookups.
   - A 7-card hand takes the best of its 21 five-card subsets, as in its `EvalEngine`.
+
+### Hands in sequential order
+
+The table above is for random hands. When the code that asks for evaluations can choose their order, each evaluator can reuse the work for the cards that didn't change. Two orders were measured (`seq` mode of both benchmarks, one thread, best of 2 passes):
+- **All hands in order**: all 133,784,560 hands, with c0 < c1 < … < c6, as an exhaustive enumeration does. The work for the first 6 cards is done once per innermost loop.
+- **Fixed boards**: every hole-card pair (1,081) on each of 20,000 random boards, in order. This is what an equity calculation, or a CFR showdown over all holdings, does. The board's work is done once.
+
+Each evaluator does this its own way:
+- Two Plus Two keeps one state per loop level.
+- OMPEval keeps one `Hand` per level.
+- `EvalHandRank` keeps one `HandKeyMask` vector per level.
+- `EvalHandValue` and Senzee keep one card mask per level.
+- `EvalHandValues` evaluates each innermost loop, or each board, as one batch.
+- phevaluator and poker.net have no incremental form, so they take the 7 cards every time.
+
+Over all hands, every evaluator's hand-type counts match the known totals. On the boards, they all match each other.
+
+| Evaluator, ns per hand | All hands in order | Fixed boards, all hole pairs | Random hands (table above) |
+|---|---|---|---|
+| Two Plus Two | **0.29** GCC, 0.38 MSVC | **0.78** GCC, 0.81 MSVC | 21.5 |
+| OMPEval | 0.59 GCC, 0.67 MSVC | 0.90 GCC, 0.94 MSVC | 1.60 |
+| PokerBot2 `EvalHandRank` | 0.74 | 1.18 | 2.28 |
+| PokerBot2 `EvalHandValues` (AVX-512 batch) | 5.37 (batches of up to 46) | 3.14 (batches of 1,081) | 2.32 |
+| PokerBot2 `EvalHandValue` | 7.83 | 7.91 | 8.4 |
+| PokerHandEvaluator (phevaluator) | 7.63 GCC, 10.29 MSVC | 9.06 GCC, 10.15 MSVC | 12.4 |
+| Senzee 7-card index | 19.8 GCC, 20.0 MSVC | 12.2 MSVC, 14.2 GCC | 28.8 |
+| poker.net | 43.5 | 47.6 | 91.0 |
+
+**Why Two Plus Two wins in order.** Its table is a state machine: `HR[state + card]` is the next state, and the 7th lookup gives the rank.
+- With one state kept per loop level, the innermost loop does one lookup per hand, `HR[u6 + c6]`.
+- Consecutive hands read consecutive entries of the same 53-entry block. That's the same few cache lines, so the size of the table (130 MB) doesn't matter.
+- OMPEval and `EvalHandRank` still do their whole lookup for every hand: 2 dependent loads, at places in the table that jump by each card's rank key.
+
+On random hands it's the other way round. Two Plus Two then needs all 7 lookups, one after the other, each a cache miss in 130 MB.
+
+On fixed boards the gap is small. Each hand costs Two Plus Two 2 lookups instead of 1, and every new board starts with a walk through cold parts of its table. Senzee's index jumps around its table even for hands in order, so order barely helps it.
+
+**For later: equity and CFR training.** Both can choose the order of the hands they evaluate: an equity calculation by enumeration, or CFR that evaluates every holding at a showdown. There, a sequential-order evaluator may be the better choice.
+- Two Plus Two enumerates everything at 0.29 ns per hand, 2.5x less than `EvalHandRank`, and takes 0.78 ns per hand against 1.18 on fixed boards.
+- Its costs are 130 MB of memory (its own generator builds the table in about 4 s), a license that's unclear (see above), and slow lookups when the hands come in random order. So it suits batch computations that walk hands in order, not the Arena's showdowns.
+- `EvalHandRank` called in order is a middle ground: 0.74 and 1.18 ns, with 180 KB of tables.
 
 ## History encoding
 
@@ -635,6 +676,7 @@ What the measurements say:
 - `EvaluatorBench/DotnetBench` builds again after `Game` moved to the `PokerBot2.GameSpace` namespace.
 - **Smaller `EvalHandRank` tables**: new `RANK_KEYS` and rows of 2,048 sums (`ROW_SHIFT = 11`), with the build unchanged. The perfect hash is a third smaller (`Ranks` + `RowOffsets` 250,888 → 167,504 B; all the tables 260 → 180 KB), which leaves about 80 KB more of the L2 for the agents. Ranks are the same as before, so results don't change. Lookups are as fast in cache, and heads-up showdowns about 9% faster with the tables in DRAM (302 → 274 ns). The tables take about 0.6 s to build on first use instead of 0.45 s. See [How `RANK_KEYS` were found](#how-rank_keys-were-found).
 - `EvaluatorBench/RankKeySearch`: the search that found those keys, starting from the greedy ones: beam search, then local search with annealing, scored by an exact 64-offsets-at-a-time copy of the table build. Its log is `RankKeySearch/search-2026-11-07.txt`. See [Searching for better `RANK_KEYS`](#searching-for-better-rank_keys).
+- **Benchmarks in sequential order** (`seq` mode of `DotnetBench` and `NativeBench`): all hands in order, and all hole-card pairs on fixed boards. Two Plus Two is the fastest there (0.29 and 0.78 ns per hand), which makes it a candidate for equity calculations and CFR training later. See [Hands in sequential order](#hands-in-sequential-order).
 
 ### 2026-11-01
 
