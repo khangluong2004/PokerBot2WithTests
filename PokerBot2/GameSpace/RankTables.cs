@@ -5,19 +5,22 @@ using System.Runtime.Intrinsics;
 
 namespace PokerBot2.GameSpace
 {
-    // Lookup tables for Game.EvalHandRank, built once (on first use, about 75 ms) from Game.EvalHandValue, so the two
-    // evaluators always order hands the same way. About 270 KB (Ranks 222 KB, RowOffsets 30 KB, Flush 16 KB), small
+    // Lookup tables for Game.EvalHandRank, built once (on first use, about 0.6 s) from Game.EvalHandValue, so the two
+    // evaluators always order hands the same way. About 180 KB (Ranks 138 KB, RowOffsets 25 KB, Flush 16 KB), small
     // enough to stay in the L2 cache while nothing else pushes it out.
     internal static class RankTables
     {
-        // Greedy search: each key is the smallest one above the previous key that keeps the sums of all multisets
-        // of up to 7 ranks unique for each number of cards. Rank 0 can be 0: with exactly 7 cards, its count is
-        // whatever the other ranks leave
-        internal static readonly int[] RANK_KEYS = [0, 1, 5, 22, 98, 453, 2031, 8698, 22854, 83661, 262349, 636345, 1479181];
-        internal const int MAX_RANK_KEY = 4 * 1479181 + 3 * 636345;
+        // The rank sums of all multisets of 7 ranks are different, and with these keys Build below packs the rows
+        // into the smallest Ranks + RowOffsets found (167,504 B). They come from a search started at the greedy
+        // keys (each the smallest above the previous one that keeps the sums apart: 0, 1, 5, 22, ..., 1479181,
+        // 250,888 B with rows of 1,024): EvaluatorBench/RankKeySearch, see README "How RANK_KEYS were found".
+        // Rank 0 can be 0: with exactly 7 cards, its count is whatever the other ranks leave
+        internal static readonly int[] RANK_KEYS = [0, 7, 35, 161, 1364, 5838, 19938, 48521, 247320, 365745, 804426, 1392250, 2262584];
+        internal const int MAX_RANK_KEY = 4 * 2262584 + 3 * 1392250;
         // Perfect hash by displacement: the rank sum's high bits pick a row, and each row has its own offset into
-        // Ranks, chosen when the table is built so that no two hands share a slot
-        const int ROW_SHIFT = 10;
+        // Ranks, chosen when the table is built so that no two hands share a slot. Rows of 2,048 sums: the keys
+        // above are tuned for that row size
+        const int ROW_SHIFT = 11;
 
         // Each card (0-51): its key (rank key in bits 0-31, 1 in its suit's counter at bits 32 + 4 * suit) and its
         // Game.ToCardMask
@@ -86,8 +89,8 @@ namespace PokerBot2.GameSpace
             }
 
             // Displacement: place the rows with the most keys first, each at the lowest offset where all its slots
-            // are still free. A row starts its search a little before the previous row with as many keys, since the
-            // offsets before that mostly failed for rows like it: 10x faster to build, for a 3% bigger table
+            // are still free. The search starts at the offset that puts the row's lowest column on the first free slot:
+            // every lower offset puts it on a used slot
             int numRows = (MAX_RANK_KEY >> ROW_SHIFT) + 1;
             int rowSize = 1 << ROW_SHIFT;
             var rowStart = new int[numRows + 1];
@@ -108,7 +111,6 @@ namespace PokerBot2.GameSpace
             }
             var rowOrder = Enumerable.Range(0, numRows).OrderByDescending(row => rowStart[row + 1] - rowStart[row]).ToArray();
             var used = new bool[4 * keys.Count + 2 * rowSize];
-            var searchStart = new int[rowSize + 1];
             var rowOffsets = new int[numRows];
             int size = 0, firstFree = 0;
             foreach (int row in rowOrder)
@@ -126,7 +128,7 @@ namespace PokerBot2.GameSpace
                     {
                         minColumn = Math.Min(minColumn, column);
                     }
-                    for (offset = Math.Max(Math.Max(0, firstFree - minColumn), searchStart[rowColumns.Length] - 256); ; offset++)
+                    for (offset = Math.Max(0, firstFree - minColumn); ; offset++)
                     {
                         bool fits = true;
                         foreach (int column in rowColumns)
@@ -142,7 +144,6 @@ namespace PokerBot2.GameSpace
                             break;
                         }
                     }
-                    searchStart[rowColumns.Length] = offset;
                     foreach (int column in rowColumns)
                     {
                         used[column + offset] = true;
@@ -151,8 +152,7 @@ namespace PokerBot2.GameSpace
                 }
                 rowOffsets[row] = offset - row * rowSize;
             }
-            // Room for a full row, so even an invalid key in an empty row stays in bounds
-            var ranks = new ushort[Math.Max(size, rowSize)];
+            var ranks = new ushort[size];
             for (int i = 0; i < keys.Count; i++)
             {
                 ranks[keys[i] + rowOffsets[keys[i] >> ROW_SHIFT]] = toRank[values[i]];

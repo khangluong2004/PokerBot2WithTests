@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics.X86;
-using PokerBot2;
+using PokerBot2.GameSpace;
 
 // Showdown evaluation when the lookup tables are not in cache, as when an agent's own work between hands evicts them.
 // Every showdown is timed on its own, after one of 4 cache states:

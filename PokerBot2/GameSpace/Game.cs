@@ -479,13 +479,14 @@ namespace PokerBot2.GameSpace
         // A hand's vector is the sum of its cards' vectors: the cards are all different, so adding their masks is
         // the same as OR-ing them, and one vector add (paddq) per card builds both. The key:
         // - Bits 0-31: the sum of RankTables.RANK_KEYS[rank]. The keys make the sum different for every multiset
-        //   of 7 ranks (at most 4 of each). The largest sum is 4 * 1479181 + 3 * 636345 = 7,825,759 < 2^23.
+        //   of 7 ranks (at most 4 of each). The largest sum is 4 * 2262584 + 3 * 1392250 = 13,227,086 < 2^24.
         // - Bits 32-47: one 4-bit counter per suit. EMPTY_HAND_KEY starts every counter at 3, so a suit with 5+
         //   cards reaches 8-10 and sets bit 3 of its counter. 3 + 7 = 10 never carries into the next counter.
         // Suit counts are all the key needs about suits: apart from a flush or a straight flush, a hand's value
         // depends only on its ranks. The counts tell whether there's a flush and in which suit, and only then are
         // that suit's ranks read from the hand mask.
-        // RANK_KEYS come from a greedy search, see README "How RANK_KEYS were found".
+        // RANK_KEYS come from a search for the smallest tables (EvaluatorBench/RankKeySearch), see README
+        // "How RANK_KEYS were found".
         // A flush is looked up by the flush suit's 13-bit rank mask, any other hand by its rank sum through a
         // perfect hash. Because keys add up, the board's vector is computed once at a showdown, and each player
         // only adds their 2 hole cards.

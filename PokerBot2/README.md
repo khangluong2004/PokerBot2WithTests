@@ -184,32 +184,40 @@ Single thread on a Ryzen 9 9900X (Zen 5), random 7-card hands (the [comparison](
 **Key.** Every card has a 64-bit key, and a hand's key is the sum of its cards' keys:
 
 ```
-bits 0-31   sum of RANK_KEYS[rank]      RANK_KEYS = 0, 1, 5, 22, 98, 453, 2031, 8698, 22854, 83661, 262349, 636345, 1479181
+bits 0-31   sum of RANK_KEYS[rank]      RANK_KEYS = 0, 7, 35, 161, 1364, 5838, 19938, 48521, 247320, 365745, 804426, 1392250, 2262584
 bits 32-47  4-bit counter per suit     EMPTY_HAND_KEY starts each counter at 3
 ```
 
 **Why suit counts are enough.** Apart from a flush or a straight flush, a hand's value depends only on its ranks; which suit each card is in doesn't matter. So the key keeps all the ranks (as the rank sum), but for the suits only how many cards each one has. The counts tell whether there's a flush, and in which suit. Only then does the evaluator need to know which ranks are in that suit, and it reads them from the hand mask.
 
-- **Rank sum.** The rank keys make the sum different for every multiset of 7 ranks (at most 4 of each), so the sum identifies the hand unless it's a flush. They come from a greedy search: each key is the smallest one above the previous key that keeps the sums unique (see [How `RANK_KEYS` were found](#how-rank_keys-were-found)). The largest sum is 7,825,759.
+- **Rank sum.** The rank keys make the sum different for every multiset of 7 ranks (at most 4 of each), so the sum identifies the hand unless it's a flush. Of all the key sets tried, these give the smallest perfect hash below (see [How `RANK_KEYS` were found](#how-rank_keys-were-found)). The largest sum is 13,227,086.
 - **Suit counters.** A suit with 5 or more cards takes its counter from 3 to 8–10, which sets the counter's bit 3. So `key & 0x8888 << 32` is the flush check, and `tzcnt` of it gives the flush suit. A counter never goes above 3 + 7 = 10, so it doesn't carry into the next one.
 
 **Lookup.**
 - **Flush**: `Flush[13-bit rank mask of the flush suit]`, 8,192 entries.
-- **Anything else**: `Ranks[rankSum + RowOffsets[rankSum >> 10]]`. This is a perfect hash by displacement: the sum's high bits pick a row, and each row has its own offset, chosen when the table is built so that the 49,205 rank multisets of 7 cards all get different slots. That's 2 dependent loads. Two smaller layouts were measured and not kept, because they're slower; see [Shrinking the rank table](#shrinking-the-rank-table).
+- **Anything else**: `Ranks[rankSum + RowOffsets[rankSum >> 11]]`. This is a perfect hash by displacement: the sum's high bits pick a row of 2,048 sums, and each row has its own offset, chosen when the table is built so that the 49,205 rank multisets of 7 cards all get different slots. That's 2 dependent loads. Two smaller layouts were measured and not kept, because they're slower; see [Shrinking the rank table](#shrinking-the-rank-table).
 
-**Tables**: `Ranks` 113,407 × 2 B (222 KB), `RowOffsets` 7,643 × 4 B (30 KB), `Flush` 16 KB, and the 52 card vectors. They're built on first use, in about 75 ms, by evaluating one hand of every rank multiset and every flush with `EvalHandValue`. They fit in the L2 cache (1 MB per core here). An agent with a big working set of its own can push them out; see [When the tables aren't in cache](#when-the-tables-arent-in-cache).
+**Tables**: `Ranks` 70,834 × 2 B (138 KB, 69% used), `RowOffsets` 6,459 × 4 B (25 KB), `Flush` 16 KB, and the 52 card vectors: about 180 KB. They're built on first use, in about 0.6 s, by evaluating one hand of every rank multiset and every flush with `EvalHandValue`. They fit in the L2 cache (1 MB per core here). An agent with a big working set of its own can push them out; see [When the tables aren't in cache](#when-the-tables-arent-in-cache).
 
 **Key and mask in one vector.** `HandKeyMask(card)` holds the key and the card mask in one `Vector128<ulong>`. The cards of a hand are all different, so adding their masks is the same as OR-ing them, and one `vpaddq` per card builds both. The mask is only read for a flush.
 
 **Showdown.** The board's key and mask are computed once, and each player only adds their 2 hole cards: `EvalHandRank(board + HandKeyMask(c1) + HandKeyMask(c2))`.
 
-**Credits.** The technique is not new. The rank keys are the ones [SKPokerEval](https://github.com/kennethshackleton/SKPokerEval) uses (found again by the same greedy search, see [How `RANK_KEYS` were found](#how-rank_keys-were-found)). The suit counters that start at 3, the 128-bit key + mask add, and the row-offset perfect hash are [OMPEval](https://github.com/zekyll/OMPEval)'s. The code and the tables here are PokerBot2's own.
+**Credits.** The technique is not new. The rank keys come from a search that started at [SKPokerEval](https://github.com/kennethshackleton/SKPokerEval)'s greedy keys (see [How `RANK_KEYS` were found](#how-rank_keys-were-found)). The suit counters that start at 3, the 128-bit key + mask add, and the row-offset perfect hash are [OMPEval](https://github.com/zekyll/OMPEval)'s. The code and the tables here are PokerBot2's own.
 
 **Limits.** Exactly 7 cards (checked by `Debug.Assert` only). For 5 or 6 cards, use `EvalHand`/`EvalHandValue`. Cards must be 0–51: the card table is bounds-checked, so a bad card throws instead of reading memory past the table. Removing that check measured about 5% faster, and wasn't kept.
 
 #### How `RANK_KEYS` were found
 
 **What the keys must do.** The rank sum `Σ count[r] × RANK_KEYS[r]` must be different for each of the 49,205 multisets of 7 ranks with at most 4 of each rank. Only then does the sum alone identify a non-flush hand.
+
+**Two steps**, both run once, offline. `RankTables.RANK_KEYS` holds the result as constants.
+1. [**A greedy search**](#the-greedy-keys) finds the smallest valid keys, `0, 1, 5, 22, ..., 1479181`. They're the ones [SKPokerEval](https://github.com/kennethshackleton/SKPokerEval) uses, and `EvalHandRank` used them until 2026-11-07.
+2. [**A search for the smallest tables**](#searching-for-better-rank_keys) starts from them. It changes the keys and the row size until the perfect hash (`Ranks` + `RowOffsets`) is as small as it can find. That took the tables from 250,888 B to 167,504 B (−33%), with the keys used now. The tool is [`EvaluatorBench/RankKeySearch`](../EvaluatorBench/RankKeySearch).
+
+With any keys, the exhaustive test would catch a clash: two clashing hands would share a table slot, so one of them would get the wrong rank.
+
+##### The greedy keys
 
 **The search** goes through the ranks from the deuce up to the ace. For each rank, it picks the smallest key above the previous one that keeps the sums apart.
 
@@ -255,24 +263,138 @@ for (int rank = 1; rank < 13; rank++)
 Why it's built this way:
 - **Only hands with the same number of cards must differ.** Two 7-card hands that agree on the higher ranks have the same number of cards left for the lower ranks. So partial sums only have to be unique within each card count. Sums for different counts may be equal, since a lookup always has exactly 7 cards. This is what keeps the keys small.
 - **The deuce gets key 0.** With exactly 7 cards, its count is 7 minus the other ranks' counts, so it adds nothing to identify the hand.
-- **The smallest keys keep the table small.** The largest sum, 4 × 1,479,181 + 3 × 636,345 = 7,825,759, fits in 23 bits. The perfect hash's row table therefore has only 7,643 entries (30 KB).
+- **Small keys keep the sums small, but not the table.** The largest sum, 4 × 1,479,181 + 3 × 636,345 = 7,825,759, fits in 23 bits. With rows of 1,024 that's only 7,643 row offsets (30 KB). But `Ranks` is only 45% full (110,158 entries for 49,205 sums): the rows placed last don't fit in the gaps the first ones left. The next step fixes that.
 
-The search runs once, offline: `RankTables.RANK_KEYS` holds its result as constants. The keys are the same as [SKPokerEval](https://github.com/kennethshackleton/SKPokerEval)'s. The exhaustive test would catch a clash: two clashing hands would share a table slot, so one of them would get the wrong rank.
+##### Searching for better `RANK_KEYS`
+
+`EvaluatorBench/RankKeySearch` searches for the keys that make `Ranks` + `RowOffsets` smallest. Only the 13 keys and the row size change. Everything else stays exactly as `RankTables.Build` does it: the same rank sums, rows of 2^`ROW_SHIFT` sums, the rows with the most sums placed first, each at its first-fit offset.
+
+**Objective**: bytes of `Ranks` (2 per entry) plus `RowOffsets` (4 per row), for the tables `RankTables.Build` would make with those keys.
+
+**A fast, exact copy of the build.** Scoring a key set means building its tables, and the search scores millions. The tool's copy of `RankTables.Build`'s first fit keeps one bit per slot and tests 64 offsets at once:
+
+```csharp
+// used: 1 bit per Ranks slot. Get64(p): the 64 used bits from slot p.
+// Bit b of `fits` says whether every column of the row is free at offset + b
+int offset = Math.Max(0, firstFree - minColumn);
+while (true)
+{
+    ulong fits = ~0UL;
+    foreach (int column in rowColumns)
+    {
+        fits &= ~Get64(column + offset);
+        if (fits == 0) break;
+    }
+    if (fits != 0) { offset += BitOperations.TrailingZeroCount(fits); break; }
+    offset += 64;
+}
+```
+
+It gives exactly the same tables as `RankTables.Build`'s loop on every key set and row size tested, and the same row offsets as the real tables (`verify` mode). It takes about 20 ms, where `RankTables.Build`'s loop takes 0.3–0.6 s.
+
+**The search**, in 3 stages:
+1. **Greedy**, as above. A variant that only keeps apart partial hands that can still become 7-card hands gives the same keys: it's the full 7-card hands that hold back the two largest keys.
+2. **Beam search, rank by rank.** Each of 16 partial key sets branches into its 3 smallest valid next keys, plus the first valid key 5, 20, 50 and 100% above the smallest. Each child is scored by completing it greedily and building the real table, and the best 16 go on.
+3. **Local search with annealing** over complete key sets, from the beam's results and the other row sizes' best.
+   - **The move.** Change one key, then repair the keys above it, so every key set stays valid. Random changes almost never stay valid, because the keys are tight: in a first try, only 29 of 4,472 did.
+
+     ```csharp
+     // state: the partial sums over the ranks below r. NextValid(k): the first key >= k that keeps them apart.
+     // target: key r moved by 0.001-10% (log-uniform), up or down. r is mostly one of the upper ranks
+     k[r] = state.NextValid(target);
+     state = state.Add(k[r]);
+     double ratio = (double)k[r] / keys[r];
+     for (int j = r + 1; j < 13; j++)
+     {
+         // Each key above keeps its old value (or, half the time, the old value scaled by the same ratio)
+         // if that's still valid, and otherwise takes the next valid key
+         int want = scaleAbove ? (int)Math.Round(keys[j] * ratio) : keys[j];
+         k[j] = state.NextValid(Math.Max(k[j - 1] + 1, want));
+         state = state.Add(k[j]);
+     }
+     ```
+   - **The beam.** Each of the 16 key sets makes 24 moved copies, scored in parallel. The next beam is the best 12 of parents and copies, plus 4 others drawn with weight exp(−(bytes − best) / T). T falls from 1% to 0.01% of the best over the run, so the search can climb out of a local minimum early on, and settles later.
+   - **A second pass** restarts each row size from every row size's best keys: keys tuned for one row size can do better at another.
+
+**Letting hands with the same value share a sum** (the build handles that unchanged) never found anything better. If two hands have equal sums, then so does every pair of hands that differ by the same rank counts, and some such pair always has different values.
+
+**How the keys used now were found.** About 70 minutes on 24 threads (Ryzen 9 9900X). The log is in [`RankKeySearch/search-2026-11-07.txt`](../EvaluatorBench/RankKeySearch/search-2026-11-07.txt).
+
+| Step | Row size | Bytes | Time |
+|---|---|---|---|
+| Greedy keys | 1,024 | 250,888 | 2 s |
+| Beam search | 1,024 | 201,276 | 4 min |
+| Local search from the beam's keys | 1,024 | 186,540 | 12 min |
+| Local search from those keys, at rows of 2,048 (207,142 B at the start) | 2,048 | 167,524 | 12 min |
+| Local search again from those, another seed: **the keys used now** | 2,048 | **167,504** | 8 min |
+
+At rows of 2,048 the keys grew (the largest by 18%) and spread the sums further apart. The commands were `all --minutes 12` (which ran the steps above at rows of 512, 1,024 and 2,048), then `local --shift 11 --minutes 8 --seed 11 --from <the best keys>`. `all` now also runs that second pass itself. The runs stop after a set time, so a rerun on another machine won't retrace them exactly.
+
+Best results:
+
+| Row size (`ROW_SHIFT`) | Greedy keys | Beam search | Local search | `Ranks` entries (used) | `RowOffsets` rows |
+|---|---|---|---|---|---|
+| 512 (9) | 239,040 B | 198,838 B | 198,838 B | 72,173 (68%) | 13,623 |
+| 1,024 (10) | 250,888 B | 201,276 B | 172,748 B (−31%) | 67,580 (73%) | 9,397 |
+| **2,048 (11), used** | 283,484 B | 224,288 B | **167,504 B** (−33% against the greedy keys at 1,024) | 70,834 (69%) | 6,459 |
+
+The best keys:
+- Rows of 2,048, **used**: `0, 7, 35, 161, 1364, 5838, 19938, 48521, 247320, 365745, 804426, 1392250, 2262584` (largest sum 13,227,086)
+- Rows of 1,024: `0, 6, 30, 138, 1169, 5019, 17142, 39720, 202125, 298921, 600015, 930592, 1707494` (largest sum 9,621,752)
+
+Lookups of random 7-card hands' rank sums, ns per lookup (`measure` mode, 2 runs):
+
+| Keys | Bytes | Cache lines | Hot | Dependent chain | Most of L2 holding other data |
+|---|---|---|---|---|---|
+| Greedy, rows of 1,024 (before) | 250,888 | 3,920 | 0.37 | 4.76 | 0.28–0.32 |
+| Best for rows of 1,024 | 172,748 | 2,700 | 0.39 | 4.84 | 0.27 |
+| **Best for rows of 2,048 (used)** | 167,504 | 2,618 | 0.38 | 4.74 | 0.24–0.28 |
+
+What it means:
+- **A third smaller**, mostly by spreading the sums out with larger keys. The rows get sparser and pack better (`Ranks` goes from 45% to 69–73% full), at the cost of a few more row offsets.
+- **Keys are tuned to their row size.** The best keys for 2,048 give 180,602 B at 1,024, and the best for 1,024 give 185,212 B at 2,048.
+- **Lookups aren't measurably faster in cache.** Both table sets fit in L2, and with most of L2 holding other data the gain is within the noise (0–15%). What's gained is space: about 80 KB more of L2 for the agents.
+- **The whole evaluator, before and after** (`EvaluatorBench`, the same build with the old and the new keys, 3 processes each, alternating). Ranks and checksums are identical.
+
+  | | Greedy keys, rows of 1,024 | Keys used now, rows of 2,048 |
+  |---|---|---|
+  | Tables built on first use | 430–474 ms | 584–592 ms |
+  | Random 7-card hands, from the cards (best) | 2.33 ns | 2.32 ns |
+  | The same, vector precomputed (best) | 1.29 ns | 1.25 ns |
+  | Showdown, hot, 2 / 6 / 9 players (best) | 12.4 / 22.0 / 28.2 ns | 12.4 / 21.9 / 28.0 ns |
+  | Heads-up showdown, L2 evicted (mean) | 59 ns | 59 ns |
+  | Heads-up showdown, tables in DRAM, code warm (mean) | 302 ns (290–317) | **274 ns** (272–278) |
+  | 9-player showdown, tables in DRAM, code warm (mean) | 295 ns | 286 ns |
+
+  In cache, it's the same speed. With the tables in DRAM, heads-up is about 9% faster, probably because the tables span fewer pages (about 41 of 4 KB instead of 61). The build is slower: the first fit takes longer on rows of 2,048.
+- **Rows of 2,048 were adopted** over the best keys for 1,024: their tables are smaller, and the lookup is the same.
+- **The local search was still improving slowly when it stopped**, so longer runs may find a little more.
+
+**To adopt other keys**, set `RANK_KEYS`, `MAX_RANK_KEY` (4 × the largest key + 3 × the second largest) and `ROW_SHIFT`. Then run the exhaustive tests, and `RankKeySearch verify` to check that the real tables are the ones the search scored.
+
+```bash
+cd EvaluatorBench
+dotnet run -c Release --project RankKeySearch -- all --minutes 12       # the whole search from the greedy keys (about 75 min)
+dotnet run -c Release --project RankKeySearch -- local --shift 11 --minutes 8 --seed 11 --from 0,7,35,161,1364,5838,19938,48601,247320,365745,804450,1392262,2252411
+dotnet run -c Release --project RankKeySearch -- measure --shift 11 0,7,35,161,1364,5838,19938,48521,247320,365745,804426,1392250,2262584
+```
 
 ### Shrinking the rank table
 
 The 49,205 non-flush rank multisets of 7 cards have only 3,537 different values: hands with the same 5 best ranks are worth the same, whatever the other 2 cards. So the rank table doesn't strictly need a slot per multiset. Two ways to use that were measured. Neither was kept: lookup speed matters more than the memory.
 
+Both were measured before the key search, with the greedy keys and rows of 1,024 (`Ranks` 215 KB + row offsets 30 KB). The keys used now shrink the perfect hash itself to 163 KB (`Ranks` 138 KB + row offsets 25 KB) with the same lookup; see [Searching for better `RANK_KEYS`](#searching-for-better-rank_keys).
+
 **Sharing slots in the perfect hash.** Letting a rank sum reuse a slot that already holds the same rank saves almost nothing. A row keeps its sums at fixed distances from each other, so two rows can only overlap where the ranks happen to match at every shared slot. Smaller rows share more, but then the table of row offsets grows:
 
-| Sums per row | `Ranks` entries, fast search, no sharing | `Ranks` entries, exhaustive search, sharing | Row offsets | Total, no sharing → sharing |
+| Sums per row | `Ranks` entries, no sharing | `Ranks` entries, sharing | Row offsets | Total, no sharing → sharing |
 |---|---|---|---|---|
-| 1,024 (used) | 113,407 | 109,660 | 30 KB | 251 → 244 KB |
-| 256 | 73,984 | 70,618 | 119 KB | 264 → 257 KB |
-| 64 | 55,019 | 45,413 | 478 KB | 585 → 566 KB |
+| 1,024 (used then) | 110,158 | 109,660 | 30 KB | 245 → 244 KB |
+| 256 | 72,131 | 70,618 | 119 KB | 260 → 257 KB |
+| 64 | 52,327 | 45,413 | 478 KB | 580 → 566 KB |
 | 16 | 49,205 | 29,211 | 1.9 MB | 2.0 → 1.9 MB |
 
-The exhaustive search also takes 0.2–0.4 s to build. The fast search (10–40 ms) finds almost no sharing: 113,179 entries at 1,024 sums per row.
+Both columns use the exact first-fit search, which takes 0.2–0.5 s to build. At 1,024 sums per row (used then), sharing saves only 498 entries (1 KB). The key search found nothing better by letting hands of equal value share a sum either.
 
 **An XOR table.** Each rank sum hashes to 3 slots, one in each third of the table, and its rank is the XOR of those 3 entries. No slot belongs to a single hand, and there are no row offsets. The table needs about 1.23 slots per rank multiset: 60,546 slots, 118 KB.
 
@@ -282,11 +404,11 @@ The hash is one multiply. Three 21-bit slices of the product are each scaled to 
 
 **Why it wasn't kept.** It halves the memory, but each lookup costs a multiply and a third load. Its 3 loads don't depend on each other, unlike the perfect hash's 2, so it's faster once the tables are out of cache. It's slower while they're in cache, which is when evaluation is a real share of the hand (JIT; cold numbers are the average of 2–3 runs):
 
-| | Perfect hash (used) | XOR table (not kept) |
+| | Perfect hash (greedy keys, used then) | XOR table (not kept) |
 |---|---|---|
-| Rank table | 251 KB (`Ranks` 222 KB + row offsets 30 KB) | **118 KB** |
-| All `EvalHandRank` tables | 270 KB | **135 KB** |
-| Build, on first use | 75 ms | **30 ms** |
+| Rank table | 245 KB (`Ranks` 215 KB + row offsets 30 KB) | **118 KB** |
+| All `EvalHandRank` tables | 260 KB | **135 KB** |
+| Build, on first use | 0.4 s | **30 ms** |
 | Random 7-card hands, from the cards | **2.3 ns** | 3.5 ns |
 | Heads-up showdown, hot | **12.5 ns** | 13.9 ns |
 | 9-player showdown, hot | **28.5 ns** | 36.7 ns |
@@ -315,7 +437,7 @@ ns per showdown, after subtracting the cost of an empty call:
 | 9 players `EvalHandValue` per player | 90 | 121 | **375** | 136 |
 | 9 players `EvalHandValues` (AVX-512 batch) | 45 | 100 | 699 | **98** |
 
-Repeated runs vary by about ±15–20% in the evicted columns. What it means:
+Measured with the greedy keys, before the key search. With the keys used now, a paired rerun put `EvalHandRank` about 9% faster heads-up with the tables cold and the code warm, and the same elsewhere within the noise; see [Searching for better `RANK_KEYS`](#searching-for-better-rank_keys). Repeated runs vary by about ±15–20% in the evicted columns. What it means:
 - **Hot, `EvalHandRank` wins**: about 2x heads-up, 1.6x at 9 players.
 - **Once the tables have dropped to L3**, heads-up `EvalHandValue` is already faster. At 9 players `EvalHandRank` still wins.
 - **Once they're in DRAM**, `EvalHandValue` (2 hands) or `EvalHandValues` (many hands) is 2.5–3.5x faster while their code is still cached: the table lookups become 2–3 dependent DRAM misses.
@@ -354,7 +476,7 @@ PokerBot2's evaluators against 5 published ones on the same 2,000,000 random 7-c
 
 | Evaluator | Language | Method | Memory | ns/hand | M hands/s |
 |---|---|---|---|---|---|
-| **PokerBot2 `EvalHandRank`** | C# | Rank-key sum + perfect hash, flush table | 270 KB | **2.28** | 439 |
+| **PokerBot2 `EvalHandRank`** | C# | Rank-key sum + perfect hash, flush table | 180 KB | **2.28** | 439 |
 | [OMPEval](https://github.com/zekyll/OMPEval) | C++ | Rank-key sum + perfect hash, flush table | 220 KB | **1.60** GCC, 2.33 MSVC | 626 |
 | PokerBot2 `EvalHandValues` (AVX-512 batch, masks given) | C# | Bit operations, 8 hands per instruction | none | 2.32 | 430 |
 | PokerBot2 `EvalHandValue` (mask given) | C# | Bit operations | none | 8.4 | 119 |
@@ -506,6 +628,13 @@ What the measurements say:
 - `IAgent.Reset(playerId, position)` is never called by the arena.
 
 ## Changelog
+
+### 2026-11-07
+
+- **Simpler table build**: `RankTables` places each row with an exact first-fit search. The search shortcut and its tuning constant (256) are gone. `Ranks` is 3% smaller (110,158 entries, 215 KB), and the tables now take about 0.4 s to build on first use instead of 75 ms. Lookups are unchanged: busy and rare rank patterns sit side by side in each row of 1,024, so the table is read from L2 either way. Placing the busiest rows first didn't change lookup speed either.
+- `EvaluatorBench/DotnetBench` builds again after `Game` moved to the `PokerBot2.GameSpace` namespace.
+- **Smaller `EvalHandRank` tables**: new `RANK_KEYS` and rows of 2,048 sums (`ROW_SHIFT = 11`), with the build unchanged. The perfect hash is a third smaller (`Ranks` + `RowOffsets` 250,888 → 167,504 B; all the tables 260 → 180 KB), which leaves about 80 KB more of the L2 for the agents. Ranks are the same as before, so results don't change. Lookups are as fast in cache, and heads-up showdowns about 9% faster with the tables in DRAM (302 → 274 ns). The tables take about 0.6 s to build on first use instead of 0.45 s. See [How `RANK_KEYS` were found](#how-rank_keys-were-found).
+- `EvaluatorBench/RankKeySearch`: the search that found those keys, starting from the greedy ones: beam search, then local search with annealing, scored by an exact 64-offsets-at-a-time copy of the table build. Its log is `RankKeySearch/search-2026-11-07.txt`. See [Searching for better `RANK_KEYS`](#searching-for-better-rank_keys).
 
 ### 2026-11-01
 
