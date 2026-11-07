@@ -14,7 +14,7 @@ namespace PokerBot2
         // Tolerance for comparing chip amounts, which can be fractional after split pots
         const double CHIP_EPSILON = 1e-9;
         // Per-seat chip buffers are padded to 2 x Vector512<double>, so vector code can load them whole.
-        // Lanes past numPlayer stay 0
+        // Lanes past numPlayer stay 0 in totalBet and handBet. Nothing uses what the vector code computes in them
         const int SEAT_LANES = 16;
 
         // Game structure: 10 small blind, 20 big blind, 2500 stack per player, up to 9 players
@@ -24,13 +24,14 @@ namespace PokerBot2
         readonly IAgent[] agents;
         // Player ids, refreshed once per hand instead of calling GetId() for every history entry
         readonly int[] ids;
-        // History action will be encode as: first 4 bits for playerId (if set to 11, then it's dealer),
-        // For player: next 1 bit = whether showdown or not,
-        // If not showdown: next 15 bits for bet (the player's bet in the current betting round, integer part for all-in),
-        // next 1 bit for fold or not, next 1 bit for all-in or not
-        // If showdown (at the end of the hand): 1 number with 30 bits for 5 card on board (6 bits each, board[0] first),
-        // 1 number for the pot size (integer part), followed by numPlayers numbers for each player:
-        // first 4 bits for playerId, the rest for their PnL (integer part, signed, decode with >> 4)
+        // History, one int per entry (see "History encoding" in the README):
+        // - Bet action (blind, call, raise, all-in, fold): first 4 bits for playerId, next 1 bit unused (always 0),
+        //   next 15 bits for the player's total bet in the current betting round (integer part, 0 for a fold),
+        //   next 1 bit for fold or not, next 1 bit for all-in or not
+        // - New street dealt: DEALER_HISTORY_STATE (playerId 11, every other bit 0)
+        // - Showdown (at the end of the hand, after the last Play): 1 number with 30 bits for 5 card on board
+        //   (6 bits each, board[0] first), 1 number for the pot size (integer part), followed by numPlayers numbers
+        //   for each player: first 4 bits for playerId, the rest for their PnL (integer part, signed, decode with >> 4)
         // Concrete List (not IList) so Add is not an interface call; capacity is kept across hands
         readonly List<int> history = new(256);
         readonly Game game;
@@ -50,7 +51,7 @@ namespace PokerBot2
             }
         }
 
-        // Reset for new round
+        // Reset for a new hand: clear the history and deal from a full deck again
         public void Reset()
         {
             history.Clear();
@@ -89,7 +90,9 @@ namespace PokerBot2
             return playerId + (((int) pnl) << 4);
         }
 
-        // Bet the player already has in the current betting round, so agents know what a call/raise costs
+        // The player's total bet so far in the current betting round, decoded from the history (integer part, 0 if they
+        // haven't acted or folded). Play already gets the exact toCall and minRaise, so this is for reading the history,
+        // such as an opponent's bet
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int GetRoundBet(IList<int> history, int playerId)
         {
@@ -263,8 +266,7 @@ namespace PokerBot2
                 return;
             }
 
-            // Use the bets over the whole hand: summing per round is wrong once a player calls a fractional
-            // all-in with its integer part, then bets more than the all-in player on a later round
+            // Use the bets over the whole hand.
             if (Vector512.IsHardwareAccelerated)
             {
                 // All seats at once: lane i adds min(handBet[i], handBet[j]) for each j, in the same order as the

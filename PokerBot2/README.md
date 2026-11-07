@@ -564,7 +564,7 @@ On fixed boards the gap is small. Each hand costs Two Plus Two 2 lookups instead
 
 | Entry | Encoding |
 |---|---|
-| Bet action (blind, call, raise, all-in, fold) | bits 0–3 `playerId`, bit 4 reserved (showdown flag, unused), bits 5–19 the player's **total bet in this betting round** (integer part), bit 20 fold, bit 21 all-in |
+| Bet action (blind, call, raise, all-in, fold) | bits 0–3 `playerId`, bit 4 reserved (showdown flag, unused), bits 5–19 the player's **total bet in this betting round** (integer part, 0 for a fold), bit 20 fold, bit 21 all-in |
 | New street dealt | `Arena.DEALER_HISTORY_STATE` (`11`) |
 | Showdown, written at the end of `HandleShowdown` | 1 entry for the board: 5 cards × 6 bits, `board[0]` lowest. Then 1 entry for the pot (integer part). Then 1 entry per player in seat order: bits 0–3 `playerId`, upper bits the signed PnL (integer part, decode with `entry >> 4`) |
 
