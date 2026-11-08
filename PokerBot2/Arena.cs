@@ -152,6 +152,7 @@ namespace PokerBot2
                         "Can't bet more than stack");
                     if (bet == Game.FOLD_VALUE)
                     {
+                        Logger.DebugOnlyConsoleLog($"Player {agent.GetId()}: Fold: Pot {pot}");
                         isFold[curPlayer] = true;
                         activePlayers--;
                         history.Add(EncodeHistoryBetState(ids[curPlayer], 0, 1, 0));
@@ -159,6 +160,7 @@ namespace PokerBot2
                     else if (bet == Game.ALL_IN_VALUE)
                     {
                         isAllIn[curPlayer] = agent.AllIn();
+                        Logger.DebugOnlyConsoleLog($"Player {agent.GetId()}: All-In {isAllIn[curPlayer]}: Pot {pot}");
                         numAllIn++;
                         pot += isAllIn[curPlayer];
 
@@ -195,6 +197,7 @@ namespace PokerBot2
                         Debug.Assert(((canRaise >> curPlayer) & 1) != 0, "Betting not re-opened, can only call or fold");
                         // toCall + minRaise can round 1 ulp below the min raise with fractional amounts
                         Debug.Assert(bet - toCall >= prevRaise - CHIP_EPSILON, "Need to raise minimum prev raise");
+                        Logger.DebugOnlyConsoleLog($"Player {agent.GetId()}: Raise {bet}: Pot {pot}");
                         pot += bet;
                         totalBet[curPlayer] += bet;
                         prevRaise = totalBet[curPlayer] - maxBet;
@@ -208,6 +211,7 @@ namespace PokerBot2
                     {
                         // Call (check if nothing to call)
                         Debug.Assert(bet == toCall, "Must fold if bet less");
+                        Logger.DebugOnlyConsoleLog($"Player {agent.GetId()}: Call {bet}: Pot {pot}");
                         pot += bet;
                         // Set exactly to avoid floating point drift from maxBet
                         totalBet[curPlayer] = maxBet;
@@ -307,6 +311,7 @@ namespace PokerBot2
             Span<double> handBet,
             double pot)
         {
+            Logger.DebugOnlyConsoleLog("Showdown");
             int finalPot = (int) pot;
             // PnL of each player: what they won minus what they bet over the hand
             Span<double> pnl = stackalloc double[numPlayer];
@@ -372,6 +377,10 @@ namespace PokerBot2
             history.Add(finalPot);
             for (int i = 0; i < numPlayer; i++)
             {
+                Logger.DebugOnlyConsoleLog($"Player {ids[i]}" +
+                    $": Hand [{Game.CardToString(agents[i].GetDealCard().card1)}, {Game.CardToString(agents[i].GetDealCard().card2)}]" +
+                    $": Fold {isFold[i]}" +
+                    $": PnL {pnl[i]}");
                 history.Add(EncodeHistoryShowdownPnL(ids[i], pnl[i]));
             }
         }
@@ -423,6 +432,7 @@ namespace PokerBot2
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void HandleEarlyFinish(int winner, double pot)
         {
+            Logger.DebugOnlyConsoleLog($"Finished early: winner {agents[winner].GetId()}: win {pot}");
             agents[winner].ReceiveReturn(pot);
             dealer = NextSeat(dealer);
         }
@@ -432,10 +442,12 @@ namespace PokerBot2
             Reset();
 
             // Heads-up: the dealer posts the small blind, acts first pre-flop and last post-flop
+            Logger.DebugOnlyConsoleLog($"New round: dealer: position: {dealer}, id: {agents[dealer].GetId()}");
             int smallBlind = numPlayer == 2 ? dealer : NextSeat(dealer);
             int bigBlind = NextSeat(smallBlind);
 
             // Deal card
+            Logger.DebugOnlyConsoleLog("Dealing card");
             for (int i = 0, seat = (dealer + 3) % numPlayer; i < numPlayer; i++, seat = NextSeat(seat)) {
                 agents[seat].ReceiveDealCard(game.DealCard(), game.DealCard());
             }
@@ -469,8 +481,11 @@ namespace PokerBot2
 
             // PRE-FLOP
             // Blinds: agents manage their own stack, so the blinds are charged as negative return
+            Logger.DebugOnlyConsoleLog("Pre-flop betting");
             agents[smallBlind].ReceiveReturn(-smallBlindAmount);
+            Logger.DebugOnlyConsoleLog($"Player {agents[smallBlind].GetId()}: Small blind: {smallBlindAmount}");
             agents[bigBlind].ReceiveReturn(-bigBlindAmount);
+            Logger.DebugOnlyConsoleLog($"Player {agents[bigBlind].GetId()}: Big blind: {bigBlindAmount}");
             totalBet[smallBlind] = smallBlindAmount;
             totalBet[bigBlind] = bigBlindAmount;
             if (smallBlindAllIn == 1)
@@ -488,7 +503,7 @@ namespace PokerBot2
 
             // Bet
             (pot, activePlayers, numAllIn, isFinished) = RoundBet(isFold, isAllIn, totalBet, handBet, board,
-                0, pot, activePlayers, numAllIn, Game.BIG_BLIND, NextSeat(bigBlind), Game.BIG_BLIND);
+                0, pot, activePlayers, numAllIn, bigBlindAmount, NextSeat(bigBlind), bigBlindAmount - smallBlindAmount);
 
             if (isFinished != -1) {
                 HandleEarlyFinish(isFinished, pot);
@@ -500,6 +515,8 @@ namespace PokerBot2
             board[0] = game.DealCard();
             board[1] = game.DealCard();
             board[2] = game.DealCard();
+            Logger.DebugOnlyConsoleLog($"Flop betting: " +
+                $"Board = [{Game.CardToString(board[0])}, {Game.CardToString(board[1])}, {Game.CardToString(board[2])}]");
             history.Add(EncodeHistoryDealState());
 
             // Bet
@@ -516,6 +533,8 @@ namespace PokerBot2
             // TURN
             // Deal
             board[3] = game.DealCard();
+            Logger.DebugOnlyConsoleLog($"Turn betting: " +
+                $"Board = [{Game.CardToString(board[0])}, {Game.CardToString(board[1])}, {Game.CardToString(board[2])}, {Game.CardToString(board[3])}]");
             history.Add(EncodeHistoryDealState());
 
             // Bet
@@ -532,6 +551,10 @@ namespace PokerBot2
             // RIVER
             // Deal
             board[4] = game.DealCard();
+            Logger.DebugOnlyConsoleLog($"River betting: " +
+                $"Board = [{Game.CardToString(board[0])}, {Game.CardToString(board[1])}, " +
+                $"{Game.CardToString(board[2])}, {Game.CardToString(board[3])}, " +
+                $"{Game.CardToString(board[4])}]");
             history.Add(EncodeHistoryDealState());
 
             // Bet

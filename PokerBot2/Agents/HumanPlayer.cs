@@ -48,7 +48,7 @@ namespace PokerBot2.Agents
             double bet = -1;
             while (!validResponse)
             {
-                Console.Write($"Player[{playerId}][{Game.CardToString(lowCard)}, {Game.CardToString(highCard)}] to call {toCall}, min raise {minRaise}: ");
+                Console.Write($"Player[{playerId}][{Game.CardToString(lowCard)}, {Game.CardToString(highCard)}] to call {toCall}, min raise {minRaise}, -1 to fold, -2 to all-in: ");
                 validResponse = double.TryParse(Console.ReadLine(), out bet);
             }
 
