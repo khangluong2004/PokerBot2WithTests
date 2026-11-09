@@ -176,7 +176,7 @@ Single thread on a Ryzen 9 9900X (Zen 5), random 7-card hands (the [comparison](
 | `EvalHandValue(ulong)` | 8.4 |
 | `EvalHandValues` (AVX-512 batch) | 2.3 |
 | `EvalHandRank(HandKeyMask(...))`, from the 7 cards | 2.3 |
-| `EvalHandRank(keyMask)`, vector given | 1.3 |
+| `EvalHandRank(keyMask)`, vector given | 1.2 |
 
 ### Table-based evaluator (`EvalHandRank`)
 
@@ -493,7 +493,7 @@ What the numbers say:
   - it reloads each table's address from its static field, since an array on the GC heap can move;
   - it bounds-checks the card table. Removing that check alone gained about 5%.
 
-  With the hand's vector already built, `EvalHandRank`'s lookup alone is 1.3 ns.
+  With the hand's vector already built, `EvalHandRank`'s lookup alone is 1.2 ns.
 - **The big tables lose on random hands.** Two Plus Two and Senzee read 130–267 MB tables, so a random hand is a cache miss, or several for Two Plus Two's 7 dependent steps. Two Plus Two is famous for enumerating all hands in order, where consecutive hands share their first 6 lookups and the table stays in cache. That's not how hands come at a showdown, but it is how an equity calculation can walk them (see [Hands in sequential order](#hands-in-sequential-order)).
 - **The old bit-operation evaluator** (`EvalHandValue`) needs no memory at all. Its AVX-512 batch matches `EvalHandRank` when there are many hands to evaluate together, but not for the 2 hands of a heads-up showdown.
 - **Not included**: [palmistry3](https://github.com/felixubl/palmistry3), a fast table-free evaluator with the same 4 × 16-bit suit layout as `EvalHand`. Its flush test needs arm64 NEON, so it doesn't build on x86 without rewriting it.
@@ -642,16 +642,32 @@ None of this runs in Release: `[Conditional("DEBUG")]` removes the calls and the
 
 Runtime settings (`TieredPGO`, GC) belong to the application. If training runs from a separate project that references PokerBot2, put them in that project's `.csproj`. Native AOT needs the Visual Studio "Desktop development with C++" workload. If the link step fails with `'vswhere.exe' is not recognized`, add `C:\Program Files (x86)\Microsoft Visual Studio\Installer` to `PATH` or publish from a Developer PowerShell.
 
-Measured on a Ryzen 9 9900X, Release, single thread, 1M hands per run, best run out of 3 processes × 5 runs (single process for "original"). The numbers include the agents' own work. "Always call" sends every hand to showdown; "mixed" folds 25%, raises 15% and goes all-in 3% of the time. Each dated column is the code of that day. The 2026-10-25 columns were re-measured next to the current code.
+Measured on a Ryzen 9 9900X, Release, single thread, 1M hands per run, best run out of 3 or more processes × 5 runs (single process for "original"). The numbers include the agents' own work. "Always call" sends every hand to showdown; "mixed" folds 25%, raises 15% and goes all-in 3% of the time. All six rows run in one process, always call first, and the Native AOT binaries have 4 or more `IAgent` types. Each dated column is the code of that day, and "now" has a `WitnessShowdown` that does nothing. The 2026-10-25 columns were re-measured on 2026-11-10 and came out within 4% of this table.
 
 | Agents | Players | Original (ns/hand) | 2026-10-24, JIT | 2026-10-25, JIT | 2026-10-25, AOT | Now, JIT | Now, Native AOT |
 |---|---|---|---|---|---|---|---|
-| Always call | 2 | 315 | 162 | 142 | 159 | **129** | 148 |
-| Always call | 6 | 583 | 373 | 286 | 336 | **231** | 290 |
-| Always call | 9 | 758 | 498 | 331 | 411 | **315** | 398 |
-| Mixed | 2 | 294 | 148 | 133 | 134 | 126 | **124** |
-| Mixed | 6 | 785 | 563 | 471 | 466 | 426 | **419** |
-| Mixed | 9 | 1,175 | 788 | 623 | 609 | 612 | **599** |
+| Always call | 2 | 315 | 162 | 142 | 159 | **128** | 149 |
+| Always call | 6 | 583 | 373 | 286 | 336 | **248** | 299 |
+| Always call | 9 | 758 | 498 | 331 | 411 | **333** | 420 |
+| Mixed | 2 | 294 | 148 | 133 | 134 | **125** | 127 |
+| Mixed | 6 | 785 | 563 | 471 | 466 | 443 | **434** |
+| Mixed | 9 | 1,175 | 788 | 623 | 609 | 642 | **627** |
+
+That table keeps one method so that its columns compare, but training doesn't run like that: a JIT process keeps optimizing for the agents it saw first, and Native AOT depends on how many agent types the binary has. For choosing a runtime, use this table instead. Each row runs alone in its own process, on the current code:
+
+| Agents | Players | JIT (ns/hand) | Native AOT, 4 or more `IAgent` types | Native AOT, at most 3 |
+|---|---|---|---|---|
+| Always call | 2 | 130 | 150 | **127** |
+| Always call | 6 | 246 | 302 | **223** |
+| Always call | 9 | 340 | 423 | **299** |
+| Mixed | 2 | 110 | 124 | **109** |
+| Mixed | 6 | **376** | 428 | **376** |
+| Mixed | 9 | 544 | 622 | **543** |
+| Mixed, 4 types seated in turn | 2 | **118** | 130 | Not possible |
+| Mixed, 4 types seated in turn | 6 | **419** | 444 | Not possible |
+| Mixed, 4 types seated in turn | 9 | **614** | 646 | Not possible |
+
+The agents in "4 types seated in turn" run the same code and differ only by their type. Heads-up seats only 2 of them.
 
 | Hand evaluator, random 7-card hands (ns/hand) | JIT | Native AOT, default CPU | Native AOT, `IlcInstructionSet=native` |
 |---|---|---|---|
@@ -667,10 +683,12 @@ Measured on a Ryzen 9 9900X, Release, single thread, 1M hands per run, best run 
 The 6-player case gained the most because the old batch only vectorizes groups of 8 hands, so 6 players ran 6 scalar evaluations.
 
 What the measurements say:
-- **The JIT is the safer choice for training**: 15–26% ahead of Native AOT with always-call agents (AOT can't devirtualize the agent calls, or the call into `System.Random`), and within 2% with mixed agents, where AOT is slightly ahead. Prefer `dotnet run -c Release` for training. Native AOT starts instantly.
+- **The JIT is the safer choice for training**: 13–24% ahead of Native AOT once the binary has 4 or more `IAgent` types, and 5–10% ahead with different types at the table. Prefer `dotnet run -c Release` for training. Native AOT starts instantly.
+- **Native AOT only catches up with at most 3 `IAgent` types in the binary**: it then ties the JIT with mixed agents, and leads by 2–12% with always-call agents. It compiles the whole program, so with up to 3 types it can check for each type and skip the interface call. At 4 types `RoundBet` is back to plain interface calls, and hands take 14–41% longer. A type counts even if it's never seated. `HumanPlayer` counts too, because `PokerBot2/Program.cs` constructs it and that `Main` is compiled in even when a separate project references PokerBot2. That leaves room for 2 agent types of your own.
+- **The JIT's PGO stays with the agents it saw first**: running mixed agents after always-call agents in one process takes 13–18% longer than running them alone (125 / 443 / 642 against 110 / 376 / 544 ns/hand). Warm up on the agents you train with. Seating 4 different types instead of 1 costs the JIT 7–13%, and Native AOT 3–6%.
 - **Train unseeded** when throughput matters (`new Arena(numPlayer, agents)`): a seeded `Random` uses the slower legacy algorithm and costs about 5–8% per hand with these benchmark agents.
 - **Native AOT without `IlcInstructionSet=native` loses AVX-512 and LZCNT**, and the batch evaluator gets 4x slower. That's why the setting is on. `EvalHandRank` doesn't need either, so it runs at the same speed with or without the setting. It is about 35% slower under Native AOT than under the JIT.
-- With a single agent type, the JIT knobs are within noise. 9 players, always call / mixed (ns/hand, 2026-10-24 code): default 459 / 777, `DOTNET_TieredPGO=0` 459 / 781, `DOTNET_TieredCompilation=0` 469 / 763, Server GC 460 / 773.
+- **Dynamic PGO is worth 10–20% with always-call agents**, and `DOTNET_TieredCompilation=0` loses it too. The GC setting makes no difference. 9 players, always call / mixed, in one process (ns/hand): default 333 / 642, `DOTNET_TieredPGO=0` 400 / 623, `DOTNET_TieredCompilation=0` 407 / 628, `DOTNET_gcServer=0` 336 / 644. Mixed agents come out ahead with PGO off here only because PGO saw always-call agents first. Run alone with PGO on, they take 544.
 - **Not enabled on purpose**: `SkipLocalsInit` showed no measurable gain (the `stackalloc` buffers are at most 9 entries), and the code relies on them starting at zero. Disabling tiered compilation gave no gain and turns off dynamic PGO.
 
 ## Known limitations
@@ -683,6 +701,13 @@ What the measurements say:
 - `WitnessShowdown` only carries the hole cards. An agent that folded, or that stopped being asked to act because of all-ins, isn't told the rest of the board.
 
 ## Changelog
+
+### 2026-11-10
+
+Benchmarks, with no code change:
+- Re-measured the [performance tables](#build-settings-and-performance), which now include `WitnessShowdown`. The evaluator and showdown tables came out within 4% and stay as they were. `EvalHandRank` with the vector given is now listed at 1.2 ns instead of 1.3.
+- **Native AOT's speed depends on how many `IAgent` types the binary has**: with at most 3, hands take up to 29% less time than with 4 or more. The older Native AOT columns came from a benchmark binary with 4 or more types: the same commits built that way reproduce them within 4%, so the code didn't cause the gap.
+- The advice to prefer the JIT for training stays, with new numbers and reasons. The old text compared mixed agents run after always-call agents, which made the JIT look 13–18% slower than it is. Its reason, that Native AOT can't devirtualize the agent calls, only holds from 4 types on.
 
 ### 2026-11-09
 
@@ -700,7 +725,7 @@ Cost of `WitnessShowdown`, with agents that do nothing in it, against two copies
 | 6 | 12–18 ns (3–8%) | up to 7 ns |
 | 9 | 16–28 ns (3–7%) | up to 16 ns |
 
-Hands still allocate 0 bytes, and 1.28M seeded hands replay identically. Moving the call loop out of `HandleShowdown`, so that PGO could devirtualize the calls (a method with `stackalloc` skips tiering), measured no better, and heads-up slightly worse, so it wasn't kept. The performance tables above weren't re-measured.
+Hands still allocate 0 bytes, and 1.28M seeded hands replay identically. Moving the call loop out of `HandleShowdown`, so that PGO could devirtualize the calls (a method with `stackalloc` skips tiering), measured no better, and heads-up slightly worse, so it wasn't kept.
 
 ### 2026-11-07
 
