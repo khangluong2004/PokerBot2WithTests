@@ -24,7 +24,7 @@ A fast No-Limit Texas Hold'em engine for training poker bots in house. It deals 
 3. Blinds are posted: small blind left of the dealer, big blind next. **Heads-up**, the dealer posts the small blind.
 4. **Pre-flop**: action starts left of the big blind and the big blind has the option.
 5. **Flop** (3 cards), **turn** (1), **river** (1): action starts left of the dealer (heads-up: the non-dealer).
-6. If only one player is left at any point, they win the pot without a showdown. Otherwise, the best hand wins at showdown, with side pots.
+6. If only one player is left at any point, they win the pot without a showdown. Otherwise, the hands still in are shown to every agent (`WitnessShowdown`), and the best hand wins, with side pots.
 7. The dealer button moves one seat to the left.
 
 **Betting rules:**
@@ -54,6 +54,7 @@ double Play(IList<int> history, Span<int> board, double toCall, double minRaise)
 - `toCall` is the exact number of chips needed to call, and `minRaise` is the minimum extra on top. `minRaise` is `+∞` when the player may not raise, i.e. a short all-in didn't reopen betting. To call, return `toCall` itself (not a recomputed amount): the arena compares the return value against it exactly.
 - **Agents manage their own stack.** `Play` must subtract whatever it returns (fold and all-in excepted). The arena charges blinds with `ReceiveReturn(-blind)` and pays winnings with `ReceiveReturn(amount)`.
 - `GetDealCard()` returns the hole cards from `ReceiveDealCard`. `GetId()` must be unique per player and fit in 4 bits (`0..15`, and not `11`, see the history encoding). The arena reads the ids when it's created and again at the start of every hand.
+- `WitnessShowdown(shownHands)` is called on every agent at a showdown, before the pot is paid, including agents that folded. `shownHands` holds `(playerId, card1, card2)` for each player still in the hand, in seat order. As at a real table, folded hands stay hidden, and a hand won because everyone else folded shows nothing. The span only lives for the call, so copy what you want to keep.
 - The arena copies the agent list when it's created. To change who sits at the table, create a new `Arena`.
 
 ### Assumptions (checked by `Debug.Assert` only)
@@ -576,7 +577,7 @@ On fixed boards the gap is small. Each hand costs Two Plus Two 2 lookups instead
 
 What the betting loop avoids, and why:
 - **No integer division**: the next seat is `seat + 1 == numPlayer ? 0 : seat + 1` instead of `(seat + 1) % numPlayer`. A division is 10+ cycles, and the loop moves to the next seat on every action.
-- **No interface calls for bookkeeping**: agents are kept in an `IAgent[]` and the history in a `List<int>` (not `IList<>`), and player ids are cached in an `int[]`. Only the real agent calls (`Play`, `AllIn`, `ReceiveDealCard`, `GetDealCard`, `ReceiveReturn`) go through the interface.
+- **No interface calls for bookkeeping**: agents are kept in an `IAgent[]` and the history in a `List<int>` (not `IList<>`), and player ids are cached in an `int[]`. Only the real agent calls (`Play`, `AllIn`, `ReceiveDealCard`, `GetDealCard`, `ReceiveReturn`, `WitnessShowdown`) go through the interface.
 - **Spans passed by value** to `RoundBet` (not `ref Span`), so the JIT can keep their pointers and lengths in registers.
 - **Side-pot entitlement computed once**, just before the showdown. It used to be recomputed after every betting round, which is a 9×9 loop once anyone is all-in, even for hands that end early.
 - **No sort at showdown**: the payout takes the best hand still in (a scan over a bit-per-seat mask), pays it, and only looks further down for the side pots that hand isn't entitled to. That's usually a single pass. The insertion sort of all hands it replaces cost about 80 ns per 9-player showdown, mostly mispredicted branches. Ties go to `PaySplit`, which orders only the tied seats by entitled pot. (`Span.Sort` was never an option: its default comparer allocated 48 B per showdown under Native AOT.)
@@ -610,12 +611,24 @@ Amounts become fractional after split pots, so the arena never recomputes a numb
 
 ## Build settings and performance
 
-Build and run with **`-c Release`**. Debug keeps the `Debug.Assert` checks (use it to validate agents); Release removes them.
+Build and run with **`-c Release`**. Debug keeps the `Debug.Assert` checks (use it to validate agents) and logs every hand to the console; Release removes both.
 
 ```bash
 dotnet run -c Release --project PokerBot2
 dotnet publish PokerBot2 -c Release -r win-x64      # Native AOT
 ```
+
+**Debug log.** Besides every action, a Debug build logs each player's pot winning and actual PnL at the end of each hand:
+
+```
+Finished early: winner 2: win 30
+Player 1: Pot winning 0: Stack 2500 -> 2490: PnL -10
+Player 2: Pot winning 30: Stack 2500 -> 2510: PnL 10
+```
+
+The pot winning is what the player got from the pot, which includes their own bets coming back. The PnL is the stack after the hand minus the stack before it, both read from the agent (`GetStack`), so a wrong number here can also mean the agent keeps its stack wrong.
+
+None of this runs in Release: `[Conditional("DEBUG")]` removes the calls and the evaluation of their arguments, and `#if DEBUG` removes the stored stacks and the method bodies. The Release IL of `RoundPlay` and `HandleEarlyFinish` is identical to the build before this was added, and the two `DebugOnly` methods remain as empty methods that nothing calls. `RoundPlay_ShouldNotRunDebugOnlyCode_InRelease` checks that nothing is logged and that no extra stacks are read.
 
 `PokerBot2.csproj` settings:
 
@@ -667,8 +680,27 @@ What the measurements say:
 - The history only keeps integer parts. Use `toCall` / `minRaise` for exact amounts.
 - Hands that end because everyone else folded don't write showdown entries.
 - `IAgent.Reset(playerId, position)` is never called by the arena.
+- `WitnessShowdown` only carries the hole cards. An agent that folded, or that stopped being asked to act because of all-ins, isn't told the rest of the board.
 
 ## Changelog
+
+### 2026-11-09
+
+API changes:
+- **`IAgent.WitnessShowdown(shownHands)`**: at a showdown, every agent sees the hole cards of the players still in, before the pot is paid. Every agent has to implement it. `HumanPlayer` prints them.
+
+Debug log:
+- Every hand now ends with each player's pot winning and actual PnL (`stack after - stack before`), including hands that end early, which only logged the pot. This replaces the `PnL` in the showdown line, which was the arena's own number and not read from the stacks. See [Build settings and performance](#build-settings-and-performance). Release builds are unaffected.
+
+Cost of `WitnessShowdown`, with agents that do nothing in it, against two copies of the previous Arena in the same process (best of 3 processes, JIT and Native AOT):
+
+| Players | Cost per hand | Difference between the two copies |
+|---|---|---|
+| 2 | 0–2 ns (within noise) | up to 3 ns |
+| 6 | 12–18 ns (3–8%) | up to 7 ns |
+| 9 | 16–28 ns (3–7%) | up to 16 ns |
+
+Hands still allocate 0 bytes, and 1.28M seeded hands replay identically. Moving the call loop out of `HandleShowdown`, so that PGO could devirtualize the calls (a method with `stackalloc` skips tiering), measured no better, and heads-up slightly worse, so it wasn't kept. The performance tables above weren't re-measured.
 
 ### 2026-11-07
 
