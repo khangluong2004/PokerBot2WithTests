@@ -35,6 +35,11 @@ namespace PokerBot2
         // Concrete List (not IList) so Add is not an interface call; capacity is kept across hands
         readonly List<int> history = new(256);
         readonly Game game;
+#if DEBUG
+        // Each seat's stack when the current hand started, for DebugOnlyLogPnL. Set by RoundPlay, so it stays 0 when a
+        // test calls HandleShowdown directly
+        readonly double[] debugStartStacks = new double[SEAT_LANES];
+#endif
 
         // seed: fixed seed for reproducible games, null = random seed
         public Arena(int numPlayer, IList<IAgent> agents, int? seed = null)
@@ -56,6 +61,34 @@ namespace PokerBot2
         {
             history.Clear();
             game.Reset();
+        }
+
+        // The DebugOnly methods cost nothing in Release: [Conditional] removes the calls and the evaluation of their
+        // arguments, and #if removes the stored stacks
+        [Conditional("DEBUG")]
+        private void DebugOnlyRecordStartStacks()
+        {
+#if DEBUG
+            for (int i = 0; i < numPlayer; i++)
+            {
+                debugStartStacks[i] = agents[i].GetStack();
+            }
+#endif
+        }
+
+        // Logs what the player actually gained or lost over the hand: stack after the hand - stack before the hand.
+        // The pot winning is logged next to it, and is not the same: it includes the player's own bets coming back.
+        // Call once the pot is paid
+        [Conditional("DEBUG")]
+        private void DebugOnlyLogPnL(int seat, double potWinning)
+        {
+#if DEBUG
+            double stack = agents[seat].GetStack();
+            Logger.DebugOnlyConsoleLog($"Player {ids[seat]}" +
+                $": Pot winning {potWinning}" +
+                $": Stack {debugStartStacks[seat]} -> {stack}" +
+                $": PnL {stack - debugStartStacks[seat]}");
+#endif
         }
 
         // Next seat clockwise, without the integer division of (seat + 1) % numPlayer
@@ -320,6 +353,8 @@ namespace PokerBot2
             // each player only adds their 2 hole cards
             var boardKeyMask = Game.HandKeyMask(board);
             Span<int> handRanks = stackalloc int[numPlayer];
+            Span<(int playerId, int card1, int card2)> shownHands = stackalloc (int playerId, int card1, int card2)[numPlayer];
+            int numShown = 0;
             // Bit per seat still in the hand (not folded)
             uint inHand = 0;
             int card1, card2;
@@ -329,6 +364,16 @@ namespace PokerBot2
                 (card1, card2) = agents[i].GetDealCard();
                 handRanks[i] = Game.EvalHandRank(boardKeyMask + Game.HandKeyMask(card1) + Game.HandKeyMask(card2));
                 inHand |= (isFold[i] ? 0u : 1u) << i;
+                // Always written, and only kept if the player is still in, so there's no branch to mispredict
+                shownHands[numShown] = (ids[i], card1, card2);
+                numShown += isFold[i] ? 0 : 1;
+            }
+
+            // As at a real table, the hands are shown before the pot is paid, and players who folded see them too
+            ReadOnlySpan<(int playerId, int card1, int card2)> witnessedHands = shownHands[..numShown];
+            for (int i = 0; i < numPlayer; i++)
+            {
+                agents[i].WitnessShowdown(witnessedHands);
             }
 
             // No sort: take the best hand still in, pay it, and only look further down for the side pots it isn't
@@ -379,8 +424,8 @@ namespace PokerBot2
             {
                 Logger.DebugOnlyConsoleLog($"Player {ids[i]}" +
                     $": Hand [{Game.CardToString(agents[i].GetDealCard().card1)}, {Game.CardToString(agents[i].GetDealCard().card2)}]" +
-                    $": Fold {isFold[i]}" +
-                    $": PnL {pnl[i]}");
+                    $": Fold {isFold[i]}");
+                DebugOnlyLogPnL(i, pnl[i] + handBet[i]);
                 history.Add(EncodeHistoryShowdownPnL(ids[i], pnl[i]));
             }
         }
@@ -434,6 +479,12 @@ namespace PokerBot2
         {
             Logger.DebugOnlyConsoleLog($"Finished early: winner {agents[winner].GetId()}: win {pot}");
             agents[winner].ReceiveReturn(pot);
+#if DEBUG
+            for (int i = 0; i < numPlayer; i++)
+            {
+                DebugOnlyLogPnL(i, i == winner ? pot : 0);
+            }
+#endif
             dealer = NextSeat(dealer);
         }
 
@@ -457,6 +508,7 @@ namespace PokerBot2
                 ids[i] = agents[i].GetId();
                 Debug.Assert(agents[i].GetStack() > 0, "Players with no chips can't be dealt in");
             }
+            DebugOnlyRecordStartStacks();
 
             Span<bool> isFold = stackalloc bool[numPlayer];
             Span<double> isAllIn = stackalloc double[numPlayer]; // Stored the all-in amount

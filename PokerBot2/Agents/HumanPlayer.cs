@@ -94,5 +94,13 @@ namespace PokerBot2.Agents
         {
             stack += money;
         }
+
+        public void WitnessShowdown(ReadOnlySpan<(int playerId, int card1, int card2)> shownHands)
+        {
+            foreach (var (shownId, card1, card2) in shownHands)
+            {
+                Console.WriteLine($"Player[{playerId}] sees player {shownId} show [{Game.CardToString(card1)}, {Game.CardToString(card2)}]");
+            }
+        }
     }
 }

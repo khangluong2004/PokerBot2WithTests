@@ -14,6 +14,9 @@ namespace PokerBot2UnitTests
             public int Id;
             public (int card1, int card2) Hole;
             public int NumCard;
+            public int NumGetStack;
+            public List<(int playerId, int card1, int card2)[]> Witnessed = [];
+            public double StackAtWitness;
             public Func<TestAgent, double, double, double> Policy = (_, _, _) => Game.FOLD_VALUE;
 
             public TestAgent(int id)
@@ -61,12 +64,19 @@ namespace PokerBot2UnitTests
 
             public double GetStack()
             {
+                NumGetStack++;
                 return Stack;
             }
 
             public void ReceiveReturn(double money)
             {
                 Stack += money;
+            }
+
+            public void WitnessShowdown(ReadOnlySpan<(int playerId, int card1, int card2)> shownHands)
+            {
+                Witnessed.Add(shownHands.ToArray());
+                StackAtWitness = Stack;
             }
         }
 
@@ -94,6 +104,22 @@ namespace PokerBot2UnitTests
                 return Game.ALL_IN_VALUE;
             }
             return toCall;
+        }
+
+        private static string CaptureConsole(Action action)
+        {
+            var original = Console.Out;
+            var writer = new StringWriter();
+            Console.SetOut(writer);
+            try
+            {
+                action();
+                return writer.ToString();
+            }
+            finally
+            {
+                Console.SetOut(original);
+            }
         }
 
         [Test]
@@ -248,6 +274,131 @@ namespace PokerBot2UnitTests
                 Assert.That(agents[2].Stack, Is.EqualTo(0));
             });
         }
+
+        [Test]
+        // Every agent sees the hands still in, once and before the pot is paid. That includes the player who folded,
+        // whose own hand stays hidden. Hands are identified by player id, in seat order.
+        public void HandleShowdown_ShouldShowHandsStillIn_ToEveryAgent()
+        {
+            var agents = Agents(3);
+            agents.ForEach(a => a.Stack = 0);
+            agents[0].Id = 5;
+            agents[1].Id = 3;
+            agents[2].Id = 7;
+            agents[0].Hole = (Game.StringToCard("K♠"), Game.StringToCard("K♦"));
+            agents[1].Hole = (Game.StringToCard("Q♠"), Game.StringToCard("Q♦"));
+            agents[2].Hole = (Game.StringToCard("A♠"), Game.StringToCard("A♦"));
+            var arena = new Arena(3, [.. agents]);
+
+            arena.HandleShowdown(Cards("2♣", "7♦", "9♥", "J♠", "K♣"), [false, false, true], new double[] { 300, 450, 450 }, new double[] { 100, 200, 150 }, 450);
+
+            var shown = new[] { (5, agents[0].Hole.card1, agents[0].Hole.card2), (3, agents[1].Hole.card1, agents[1].Hole.card2) };
+            Assert.Multiple(() =>
+            {
+                foreach (var agent in agents)
+                {
+                    Assert.That(agent.Witnessed, Has.Count.EqualTo(1));
+                    Assert.That(agent.Witnessed[0], Is.EqualTo(shown));
+                    Assert.That(agent.StackAtWitness, Is.EqualTo(0), "Shown before the pot is paid");
+                }
+                Assert.That(agents[0].Stack, Is.EqualTo(300));
+            });
+        }
+
+        [Test]
+        // A full hand: every hand is shown, including that of a player who has been all-in since the blinds.
+        public void RoundPlay_ShouldShowEveryHand_WhenNobodyFolds()
+        {
+            var agents = Agents(3);
+            agents.ForEach(a => a.Policy = CallPolicy);
+            agents[1].Stack = 5;
+            var arena = new Arena(3, [.. agents]);
+
+            arena.RoundPlay();
+
+            var shown = agents.Select(a => (a.Id, a.Hole.card1, a.Hole.card2)).ToArray();
+            Assert.Multiple(() =>
+            {
+                foreach (var agent in agents)
+                {
+                    Assert.That(agent.Witnessed, Has.Count.EqualTo(1));
+                    Assert.That(agent.Witnessed[0], Is.EqualTo(shown));
+                }
+            });
+        }
+
+        [Test]
+        // No showdown when everyone else folds: the winner doesn't have to show.
+        public void RoundPlay_ShouldShowNoHands_WhenEveryoneFolds()
+        {
+            var agents = Agents(3);
+            var arena = new Arena(3, [.. agents]);
+
+            arena.RoundPlay();
+
+            Assert.That(agents.Sum(a => a.Witnessed.Count), Is.EqualTo(0));
+        }
+
+#if DEBUG
+        [Test]
+        // The big blind wins a pot of 30, but only gains the small blind: the pot includes their own big blind.
+        public void RoundPlay_ShouldLogPotWinningAndStackChange_WhenEveryoneFolds()
+        {
+            var agents = Agents(3);
+            var arena = new Arena(3, [.. agents]);
+
+            string log = CaptureConsole(arena.RoundPlay);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(log, Does.Contain($"Player 0: Pot winning 0: Stack {Game.STACK} -> {Game.STACK}: PnL 0"));
+                Assert.That(log, Does.Contain($"Player 1: Pot winning 0: Stack {Game.STACK} -> {Game.STACK - 10}: PnL -10"));
+                Assert.That(log, Does.Contain($"Player 2: Pot winning 30: Stack {Game.STACK} -> {Game.STACK + 10}: PnL 10"));
+            });
+        }
+
+        [Test]
+        // Heads-up, both call the big blind and check down: each put in 20, and what they got from the pot depends on
+        // the cards.
+        public void RoundPlay_ShouldLogPotWinningAndStackChange_AtShowdown([Range(1, 5)] int seed)
+        {
+            var agents = Agents(2);
+            agents.ForEach(a => a.Policy = CallPolicy);
+            var arena = new Arena(2, [.. agents], seed);
+
+            string log = CaptureConsole(arena.RoundPlay);
+
+            Assert.Multiple(() =>
+            {
+                foreach (var agent in agents)
+                {
+                    double pnl = agent.Stack - Game.STACK;
+                    Assert.That(log, Does.Contain($"Player {agent.Id}: Pot winning {pnl + Game.BIG_BLIND}: Stack {Game.STACK} -> {agent.Stack}: PnL {pnl}"));
+                }
+            });
+        }
+#else
+        [Test]
+        // Release: nothing is logged, the only stack reads are the 2 for the blinds, and the stored stacks don't exist.
+        public void RoundPlay_ShouldNotRunDebugOnlyCode_InRelease([Values] bool goesToShowdown)
+        {
+            var agents = Agents(3);
+            if (goesToShowdown)
+            {
+                agents.ForEach(a => a.Policy = CallPolicy);
+            }
+            var arena = new Arena(3, [.. agents]);
+
+            string log = CaptureConsole(arena.RoundPlay);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(log, Is.Empty);
+                Assert.That(agents.Sum(a => a.NumGetStack), Is.EqualTo(2));
+                Assert.That(typeof(Arena).GetField("debugStartStacks", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance), Is.Null);
+            });
+        }
+#endif
 
         // Plays seeded random hands (seeded agents and deck), asserting chips are conserved after every hand.
         // Debug.Assert failures inside the arena also fail the test.

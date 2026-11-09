@@ -23,5 +23,10 @@ namespace PokerBot2.Agents
         public double GetStack();
 
         public void ReceiveReturn(double money);
+
+        // Called on every agent at a showdown, folded or not, before the pot is paid: the hole cards of each player
+        // still in the hand, in seat order. Not called when the hand ends because everyone else folded.
+        // The span is only valid during the call: copy what you want to keep.
+        public void WitnessShowdown(ReadOnlySpan<(int playerId, int card1, int card2)> shownHands);
     }
 }
