@@ -180,7 +180,7 @@ namespace PokerBot2
                     // Exact chips needed to call, and the min raise on top of it (infinite if betting not re-opened)
                     toCall = maxBet - totalBet[curPlayer];
                     bet = agent.Play(history, dealtBoard, toCall,
-                        ((canRaise >> curPlayer) & 1) != 0 ? prevRaise : double.PositiveInfinity);
+                        ((canRaise >> curPlayer) & 1) != 0 ? prevRaise : double.PositiveInfinity, pot);
                     Debug.Assert(bet == Game.FOLD_VALUE || bet == Game.ALL_IN_VALUE || agent.GetStack() >= 0,
                         "Can't bet more than stack");
                     if (bet == Game.FOLD_VALUE)

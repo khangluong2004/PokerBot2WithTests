@@ -41,14 +41,14 @@ namespace PokerBot2.Agents
             }
         }
 
-        public double Play(IList<int> history, Span<int> board, double toCall, double minRaise)
+        public double Play(IList<int> history, Span<int> board, double toCall, double minRaise, double pot)
         {
             // Decide and return the bet amount
             bool validResponse = false;
             double bet = -1;
             while (!validResponse)
             {
-                Console.Write($"Player[{playerId}][{Game.CardToString(lowCard)}, {Game.CardToString(highCard)}] to call {toCall}, min raise {minRaise}, -1 to fold, -2 to all-in: ");
+                Console.Write($"Player[{playerId}][{Game.CardToString(lowCard)}, {Game.CardToString(highCard)}] stack={stack} pot={pot}: call={toCall}, minRaise={minRaise}, allIn=-2, fold=-1: ");
                 validResponse = double.TryParse(Console.ReadLine(), out bet);
             }
 
@@ -99,7 +99,7 @@ namespace PokerBot2.Agents
         {
             foreach (var (shownId, card1, card2) in shownHands)
             {
-                Console.WriteLine($"Player[{playerId}] sees player {shownId} show [{Game.CardToString(card1)}, {Game.CardToString(card2)}]");
+                Console.WriteLine($"Player[{playerId}]: Player {shownId}: [{Game.CardToString(card1)}, {Game.CardToString(card2)}]");
             }
         }
     }
