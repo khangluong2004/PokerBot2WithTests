@@ -18,5 +18,5 @@ testHand[6] = 7;
 Console.WriteLine($"Warm-up to build the rank tables: {Game.EvalHandRank(Game.HandKeyMask(testHand))}");
 
 Logger.DebugOnlyConsoleLog("Test play: Human player vs human player");
-Arena arena = new(2, [new HumanPlayer(1), new HumanPlayer(2)], 2605);
+Arena arena = new(2, [new HumanPlayer(1), new RandomPlayer(2)]);
 arena.RoundPlay();
