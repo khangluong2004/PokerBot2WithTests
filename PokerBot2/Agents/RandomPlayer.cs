@@ -64,7 +64,7 @@ namespace PokerBot2.Agents
             id = playerId;
         }
 
-        public void WitnessShowdown(ReadOnlySpan<(int playerId, int card1, int card2)> shownHands)
+        public void WitnessShowdown(ReadOnlySpan<int> board, ReadOnlySpan<(int playerId, int card1, int card2)> shownHands)
         {
             return;
         }

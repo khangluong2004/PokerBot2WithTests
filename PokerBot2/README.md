@@ -24,7 +24,7 @@ A fast No-Limit Texas Hold'em engine for training poker bots in house. It deals 
 3. Blinds are posted: small blind left of the dealer, big blind next. **Heads-up**, the dealer posts the small blind.
 4. **Pre-flop**: action starts left of the big blind and the big blind has the option.
 5. **Flop** (3 cards), **turn** (1), **river** (1): action starts left of the dealer (heads-up: the non-dealer).
-6. If only one player is left at any point, they win the pot without a showdown. Otherwise, the hands still in are shown to every agent (`WitnessShowdown`), and the best hand wins, with side pots.
+6. If only one player is left at any point, they win the pot without a showdown. Otherwise, the board and the hands still in are shown to every agent (`WitnessShowdown`), and the best hand wins, with side pots.
 7. The dealer button moves one seat to the left.
 
 **Betting rules:**
@@ -41,7 +41,7 @@ A fast No-Limit Texas Hold'em engine for training poker bots in house. It deals 
 ## Agent contract (`IAgent`)
 
 ```csharp
-double Play(IList<int> history, Span<int> board, double toCall, double minRaise);
+double Play(IList<int> history, Span<int> board, double toCall, double minRaise, double pot);
 ```
 
 | Return | Meaning |
@@ -51,10 +51,10 @@ double Play(IList<int> history, Span<int> board, double toCall, double minRaise)
 | `toCall + r`, with `r >= minRaise` | Raise by `r` |
 | `Game.ALL_IN_VALUE` | All-in: the arena then calls `AllIn()`, which returns the whole stack and sets it to 0 |
 
-- `toCall` is the exact number of chips needed to call, and `minRaise` is the minimum extra on top. `minRaise` is `+∞` when the player may not raise, i.e. a short all-in didn't reopen betting. To call, return `toCall` itself (not a recomputed amount): the arena compares the return value against it exactly.
+- `toCall` is the exact number of chips needed to call, and `minRaise` is the minimum extra on top. `minRaise` is `+∞` when the player may not raise, i.e. a short all-in didn't reopen betting. To call, return `toCall` itself (not a recomputed amount): the arena compares the return value against it exactly. `pot` is every chip put in so far this hand, blinds included, before this action.
 - **Agents manage their own stack.** `Play` must subtract whatever it returns (fold and all-in excepted). The arena charges blinds with `ReceiveReturn(-blind)` and pays winnings with `ReceiveReturn(amount)`.
 - `GetDealCard()` returns the hole cards from `ReceiveDealCard`. `GetId()` must be unique per player and fit in 4 bits (`0..15`, and not `11`, see the history encoding). The arena reads the ids when it's created and again at the start of every hand.
-- `WitnessShowdown(shownHands)` is called on every agent at a showdown, before the pot is paid, including agents that folded. `shownHands` holds `(playerId, card1, card2)` for each player still in the hand, in seat order. As at a real table, folded hands stay hidden, and a hand won because everyone else folded shows nothing. The span only lives for the call, so copy what you want to keep.
+- `WitnessShowdown(board, shownHands)` is called on every agent at a showdown, before the pot is paid, including agents that folded. `board` is all 5 cards: an agent that folded, or stopped being asked to act because of all-ins, hasn't seen them all through `Play`. `shownHands` holds `(playerId, card1, card2)` for each player still in the hand, in seat order. As at a real table, folded hands stay hidden, and a hand won because everyone else folded shows nothing. The spans only live for the call, so copy what you want to keep.
 - The arena copies the agent list when it's created. To change who sits at the table, create a new `Arena`.
 
 ### Assumptions (checked by `Debug.Assert` only)
@@ -698,9 +698,19 @@ What the measurements say:
 - The history only keeps integer parts. Use `toCall` / `minRaise` for exact amounts.
 - Hands that end because everyone else folded don't write showdown entries.
 - `IAgent.Reset(playerId, position)` is never called by the arena.
-- `WitnessShowdown` only carries the hole cards. An agent that folded, or that stopped being asked to act because of all-ins, isn't told the rest of the board.
 
 ## Changelog
+
+### 2026-11-15
+
+API changes:
+- **`IAgent.WitnessShowdown(board, shownHands)`** now also gets the 5-card board, so an agent that folded, or stopped being asked to act because of all-ins, still sees the whole board. Every agent has to add the parameter. `HumanPlayer` prints the board before the hands.
+- The agent contract shows the `pot` parameter that `Play` gained on 2026-11-11: every chip put in so far this hand, blinds included, before this action.
+
+Tests:
+- `TestAgent.Play` takes `pot`, so the tests compile again. The showdown tests check the board, including for a player who has been all-in since the blinds.
+
+Cost, against the previous Arena in the same process (best of 3 processes, 2 runs, JIT and Native AOT): nothing above the noise. Heads-up it's within 4 ns, and at 6–9 players with always-call agents within 5 ns, where two identical copies of the previous Arena differ by up to 11 ns. Mixed agents at 6–9 players vary too much to tell: up to 34 ns between the identical copies. Hands still allocate 0 bytes, and 1.28M seeded hands replay identically, with every agent shown the board the history records.
 
 ### 2026-11-10
 

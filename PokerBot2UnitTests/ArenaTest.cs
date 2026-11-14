@@ -16,6 +16,7 @@ namespace PokerBot2UnitTests
             public int NumCard;
             public int NumGetStack;
             public List<(int playerId, int card1, int card2)[]> Witnessed = [];
+            public List<int[]> WitnessedBoards = [];
             public double StackAtWitness;
             public Func<TestAgent, double, double, double> Policy = (_, _, _) => Game.FOLD_VALUE;
 
@@ -39,7 +40,7 @@ namespace PokerBot2UnitTests
                 return Hole;
             }
 
-            public double Play(IList<int> history, Span<int> board, double toCall, double minRaise)
+            public double Play(IList<int> history, Span<int> board, double toCall, double minRaise, double pot)
             {
                 NumCard = board.Length;
                 double bet = Policy(this, toCall, minRaise);
@@ -73,8 +74,9 @@ namespace PokerBot2UnitTests
                 Stack += money;
             }
 
-            public void WitnessShowdown(ReadOnlySpan<(int playerId, int card1, int card2)> shownHands)
+            public void WitnessShowdown(ReadOnlySpan<int> board, ReadOnlySpan<(int playerId, int card1, int card2)> shownHands)
             {
+                WitnessedBoards.Add(board.ToArray());
                 Witnessed.Add(shownHands.ToArray());
                 StackAtWitness = Stack;
             }
@@ -276,8 +278,8 @@ namespace PokerBot2UnitTests
         }
 
         [Test]
-        // Every agent sees the hands still in, once and before the pot is paid. That includes the player who folded,
-        // whose own hand stays hidden. Hands are identified by player id, in seat order.
+        // Every agent sees the board and the hands still in, once and before the pot is paid. That includes the player
+        // who folded, whose own hand stays hidden. Hands are identified by player id, in seat order.
         public void HandleShowdown_ShouldShowHandsStillIn_ToEveryAgent()
         {
             var agents = Agents(3);
@@ -290,7 +292,8 @@ namespace PokerBot2UnitTests
             agents[2].Hole = (Game.StringToCard("A♠"), Game.StringToCard("A♦"));
             var arena = new Arena(3, [.. agents]);
 
-            arena.HandleShowdown(Cards("2♣", "7♦", "9♥", "J♠", "K♣"), [false, false, true], new double[] { 300, 450, 450 }, new double[] { 100, 200, 150 }, 450);
+            var board = Cards("2♣", "7♦", "9♥", "J♠", "K♣");
+            arena.HandleShowdown(board, [false, false, true], new double[] { 300, 450, 450 }, new double[] { 100, 200, 150 }, 450);
 
             var shown = new[] { (5, agents[0].Hole.card1, agents[0].Hole.card2), (3, agents[1].Hole.card1, agents[1].Hole.card2) };
             Assert.Multiple(() =>
@@ -299,6 +302,8 @@ namespace PokerBot2UnitTests
                 {
                     Assert.That(agent.Witnessed, Has.Count.EqualTo(1));
                     Assert.That(agent.Witnessed[0], Is.EqualTo(shown));
+                    Assert.That(agent.WitnessedBoards, Has.Count.EqualTo(1));
+                    Assert.That(agent.WitnessedBoards[0], Is.EqualTo(board));
                     Assert.That(agent.StackAtWitness, Is.EqualTo(0), "Shown before the pot is paid");
                 }
                 Assert.That(agents[0].Stack, Is.EqualTo(300));
@@ -306,7 +311,8 @@ namespace PokerBot2UnitTests
         }
 
         [Test]
-        // A full hand: every hand is shown, including that of a player who has been all-in since the blinds.
+        // A full hand: every hand is shown, including that of a player who has been all-in since the blinds. That player
+        // never sees the board through Play, so the showdown is where they get all 5 cards.
         public void RoundPlay_ShouldShowEveryHand_WhenNobodyFolds()
         {
             var agents = Agents(3);
@@ -317,12 +323,19 @@ namespace PokerBot2UnitTests
             arena.RoundPlay();
 
             var shown = agents.Select(a => (a.Id, a.Hole.card1, a.Hole.card2)).ToArray();
+            // The showdown history starts with the board (6 bits per card), then the pot, then 1 entry per player
+            var history = History(arena);
+            int boardEntry = history[history.Count - agents.Count - 2];
+            var board = Enumerable.Range(0, 5).Select(i => (boardEntry >> (6 * i)) & 0b11_1111).ToArray();
             Assert.Multiple(() =>
             {
+                Assert.That(agents[1].NumCard, Is.LessThan(5), "The all-in player never saw the river through Play");
                 foreach (var agent in agents)
                 {
                     Assert.That(agent.Witnessed, Has.Count.EqualTo(1));
                     Assert.That(agent.Witnessed[0], Is.EqualTo(shown));
+                    Assert.That(agent.WitnessedBoards, Has.Count.EqualTo(1));
+                    Assert.That(agent.WitnessedBoards[0], Is.EqualTo(board));
                 }
             });
         }

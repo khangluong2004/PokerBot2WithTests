@@ -95,8 +95,14 @@ namespace PokerBot2.Agents
             stack += money;
         }
 
-        public void WitnessShowdown(ReadOnlySpan<(int playerId, int card1, int card2)> shownHands)
+        public void WitnessShowdown(ReadOnlySpan<int> board, ReadOnlySpan<(int playerId, int card1, int card2)> shownHands)
         {
+            var boardCards = new string[board.Length];
+            for (int i = 0; i < board.Length; i++)
+            {
+                boardCards[i] = Game.CardToString(board[i]);
+            }
+            Console.WriteLine($"Player[{playerId}]: Board: [{string.Join(", ", boardCards)}]");
             foreach (var (shownId, card1, card2) in shownHands)
             {
                 Console.WriteLine($"Player[{playerId}]: Player {shownId}: [{Game.CardToString(card1)}, {Game.CardToString(card2)}]");

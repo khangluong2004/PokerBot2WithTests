@@ -369,11 +369,13 @@ namespace PokerBot2
                 numShown += isFold[i] ? 0 : 1;
             }
 
-            // As at a real table, the hands are shown before the pot is paid, and players who folded see them too
+            // As at a real table, the hands are shown before the pot is paid, and players who folded see them too, along
+            // with the whole board, which they may not have seen through Play
+            ReadOnlySpan<int> witnessedBoard = board;
             ReadOnlySpan<(int playerId, int card1, int card2)> witnessedHands = shownHands[..numShown];
             for (int i = 0; i < numPlayer; i++)
             {
-                agents[i].WitnessShowdown(witnessedHands);
+                agents[i].WitnessShowdown(witnessedBoard, witnessedHands);
             }
 
             // No sort: take the best hand still in, pay it, and only look further down for the side pots it isn't
