@@ -494,6 +494,18 @@ namespace PokerBot2.GameSpace
         // Bit 3 of each suit counter
         const ulong FLUSH_CHECK = 0x8888UL << 32;
 
+        // Builds EvalHandRank's tables now (about 0.6 s on the first run, 1 ms on later ones, see RankTables) instead
+        // of on first use, so that the build doesn't land in the first hand of training or in a timed loop. Does
+        // nothing once they're built. Other threads that call it, or use the tables, while they're being built wait
+        // until they're ready. If the build throws, every later use of the tables throws TypeInitializationException.
+        // RunClassConstructor always runs RankTables' static constructor. Reading a table and dropping the result
+        // does too today, but only because RankTables declares a static constructor: without one the runtime may run
+        // the initializers later than that read
+        public static void BuildTables()
+        {
+            RuntimeHelpers.RunClassConstructor(typeof(RankTables).TypeHandle);
+        }
+
         // Key and card mask of one card
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector128<ulong> HandKeyMask(int card)

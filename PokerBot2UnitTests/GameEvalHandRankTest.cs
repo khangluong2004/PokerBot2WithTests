@@ -161,6 +161,69 @@ namespace PokerBot2UnitTests
             });
         }
 
+        // Another test may have built the tables already in this process, so this can't see BuildTables doing the
+        // build. It checks that it's safe to call at any time and from many threads at once, and that the tables are
+        // complete afterwards
+        [Test]
+        public void BuildTables_ShouldLeaveTablesReady_WhenCalledFromManyThreads()
+        {
+            Parallel.For(0, 16, _ => Game.BuildTables());
+            Game.BuildTables();
+
+            var random = new Random(20261115);
+            var deck = Enumerable.Range(0, 52).ToArray();
+            var check = new OrderCheck();
+            for (int i = 0; i < 10_000; i++)
+            {
+                int[] hand = RandomHand(random, deck);
+                check.Add(Game.EvalHandValue(Game.ToHandMask(hand)), Game.EvalHandRank(Game.HandKeyMask(hand)));
+            }
+            check.AssertSameOrder();
+        }
+
+        // The tables in use, a fresh build and the tables file must all hold the same bytes. The tables in use were
+        // loaded from the file if it was there when the tests started, and built otherwise. Builds once, so it
+        // takes about 0.6 s (1.5 s in Debug)
+        [Test]
+        public void RankTables_ShouldBeTheSame_InUseBuiltAndInTheFile()
+        {
+            const System.Reflection.BindingFlags PRIVATE_STATIC = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+            Type tables = typeof(Game).Assembly.GetType("PokerBot2.GameSpace.RankTables")!;
+            // CardKeyMasks, Flush, the row offsets and the ranks, as the file holds them
+            byte[] Bytes(int[] rowOffsets, ushort[] ranks)
+            {
+                var cardKeyMasks = (System.Runtime.Intrinsics.Vector128<ulong>[])tables.GetField("CardKeyMasks", PRIVATE_STATIC)!.GetValue(null)!;
+                var flush = (ushort[])tables.GetField("Flush", PRIVATE_STATIC)!.GetValue(null)!;
+                return
+                [
+                    .. System.Runtime.InteropServices.MemoryMarshal.AsBytes(cardKeyMasks.AsSpan()),
+                    .. System.Runtime.InteropServices.MemoryMarshal.AsBytes(flush.AsSpan()),
+                    .. System.Runtime.InteropServices.MemoryMarshal.AsBytes(rowOffsets.AsSpan()),
+                    .. System.Runtime.InteropServices.MemoryMarshal.AsBytes(ranks.AsSpan()),
+                ];
+            }
+            string path = Path.Combine(AppContext.BaseDirectory, "RankTables.bin");
+
+            Game.BuildTables();
+            byte[] inUse = Bytes(
+                (int[])tables.GetField("RowOffsets", PRIVATE_STATIC)!.GetValue(null)!,
+                (ushort[])tables.GetField("Ranks", PRIVATE_STATIC)!.GetValue(null)!);
+            Assert.That(File.Exists(path), "BuildTables leaves the tables file next to the executable");
+            byte[] inFile = File.ReadAllBytes(path);
+            // Build and Load fill CardKeyMasks and Flush again, in place
+            var built = ((int[] rowOffsets, ushort[] ranks))tables.GetMethod("Build", PRIVATE_STATIC)!.Invoke(null, null)!;
+            byte[] builtBytes = Bytes(built.rowOffsets, built.ranks);
+            var loaded = ((int[] rowOffsets, ushort[] ranks))tables.GetMethod("Load", PRIVATE_STATIC)!.Invoke(null, [path])!;
+            byte[] loadedBytes = Bytes(loaded.rowOffsets, loaded.ranks);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(inUse.AsSpan().SequenceEqual(builtBytes), "The tables in use aren't what the code builds: delete RankTables.bin from the output folders");
+                Assert.That(inFile.AsSpan().SequenceEqual(builtBytes), "The file isn't what the code builds: delete RankTables.bin from the output folders");
+                Assert.That(loadedBytes.AsSpan().SequenceEqual(builtBytes), "Loading the file doesn't give the tables it holds");
+            });
+        }
+
         [Test, Explicit("Exhaustive over all 133,784,560 seven-card hands, takes about 10 seconds")]
         public void EvalHandRank_ShouldOrderAllSevenCardHandsLikeEvalHandValue()
         {

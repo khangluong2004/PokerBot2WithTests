@@ -20,7 +20,7 @@ public static unsafe class ColdBench
 
     public static void Run()
     {
-        Game.HandKeyMask(0); // build EvalHandRank's tables
+        Game.BuildTables();
         var l2Buffer = GC.AllocateArray<byte>(4 << 20, pinned: true);
         var l3Buffer = GC.AllocateArray<byte>(64 << 20, pinned: true);
         l3Buffer.AsSpan().Fill(1); // commit the pages

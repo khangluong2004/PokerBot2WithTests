@@ -166,6 +166,7 @@ With fillers (fewer than 5 real cards) a missing kicker is rank `-1`, so values 
 | `HandKeyMask(int card)`, `HandKeyMask(ReadOnlySpan<int> cards)` | A card's (or the cards') key and mask in one `Vector128<ulong>`, for `EvalHandRank`. Add them up: `HandKeyMask(board) + HandKeyMask(c1) + HandKeyMask(c2)`. `HandKeyMask([])` is the empty hand |
 | `EvalHandRank(Vector128<ulong> keyMask)` | **Fastest** while its tables are in cache, exactly 7 cards. Single `int` rank, higher wins, equal = split pot. Used by `Arena.HandleShowdown` |
 | `HandRankType(int handRank)` | The `WinHandType` of a rank (`rank >> 12`) |
+| `BuildTables()` | Builds `EvalHandRank`'s tables now (about 0.6 s on the first run, about 1 ms on later ones, which load them from a file) instead of on first use. Call it once before training or timing. Does nothing once they're built, and is safe to call from several threads |
 
 Single thread on a Ryzen 9 9900X (Zen 5), random 7-card hands (the [comparison](#comparison-with-other-evaluators) has the method):
 
@@ -198,7 +199,7 @@ bits 32-47  4-bit counter per suit     EMPTY_HAND_KEY starts each counter at 3
 - **Flush**: `Flush[13-bit rank mask of the flush suit]`, 8,192 entries.
 - **Anything else**: `Ranks[rankSum + RowOffsets[rankSum >> 11]]`. This is a perfect hash by displacement: the sum's high bits pick a row of 2,048 sums, and each row has its own offset, chosen when the table is built so that the 49,205 rank multisets of 7 cards all get different slots. That's 2 dependent loads. Two smaller layouts were measured and not kept, because they're slower; see [Shrinking the rank table](#shrinking-the-rank-table).
 
-**Tables**: `Ranks` 70,834 × 2 B (138 KB, 69% used), `RowOffsets` 6,459 × 4 B (25 KB), `Flush` 16 KB, and the 52 card vectors: about 180 KB. They're built on first use, in about 0.6 s, by evaluating one hand of every rank multiset and every flush with `EvalHandValue`. They fit in the L2 cache (1 MB per core here). An agent with a big working set of its own can push them out; see [When the tables aren't in cache](#when-the-tables-arent-in-cache).
+**Tables**: `Ranks` 70,834 × 2 B (138 KB, 69% used), `RowOffsets` 6,459 × 4 B (25 KB), `Flush` 16 KB, and the 52 card vectors: about 180 KB. They're built on first use, or by `BuildTables()`, by evaluating one hand of every rank multiset and every flush with `EvalHandValue`. That takes about 0.6 s, so the first run saves them to a file, and later runs load it in about 1 ms (see [Tables file](#tables-file)). They fit in the L2 cache (1 MB per core here). An agent with a big working set of its own can push them out; see [When the tables aren't in cache](#when-the-tables-arent-in-cache).
 
 **Key and mask in one vector.** `HandKeyMask(card)` holds the key and the card mask in one `Vector128<ulong>`. The cards of a hand are all different, so adding their masks is the same as OR-ing them, and one `vpaddq` per card builds both. The mask is only read for a flush.
 
@@ -207,6 +208,28 @@ bits 32-47  4-bit counter per suit     EMPTY_HAND_KEY starts each counter at 3
 **Credits.** The technique is not new. The rank keys come from a search that started at [SKPokerEval](https://github.com/kennethshackleton/SKPokerEval)'s greedy keys (see [How `RANK_KEYS` were found](#how-rank_keys-were-found)). The suit counters that start at 3, the 128-bit key + mask add, and the row-offset perfect hash are [OMPEval](https://github.com/zekyll/OMPEval)'s. The code and the tables here are PokerBot2's own.
 
 **Limits.** Exactly 7 cards (checked by `Debug.Assert` only). For 5 or 6 cards, use `EvalHand`/`EvalHandValue`. Cards must be 0–51: the card table is bounds-checked, so a bad card throws instead of reading memory past the table. Removing that check measured about 5% faster, and wasn't kept.
+
+#### Tables file
+
+Building the tables takes about 0.6 s, nearly all of it placing the rows of the perfect hash. So the first run saves the four tables to `RankTables.bin` next to the executable (raw bytes, 185 KB), and later runs load that file instead of building:
+
+| Until the tables are ready, in a fresh process (ms) | JIT | Native AOT | Debug build |
+|---|---|---|---|
+| No file: build, then write the file | 580 | 556 | 1,501 |
+| With the file | **1.2** | **0.2** | **1.3** |
+
+- **Nothing checks that the file matches the code.** Delete it after changing `RankTables` or `EvalHandValue`: until then the old tables stay in use. The test `RankTables_ShouldBeTheSame_InUseBuiltAndInTheFile` fails while the test project's file isn't what the code builds.
+- Each output folder gets its own file: `bin/Release/...`, `bin/Debug/...`, the test project's, a publish folder. Deleting it is always safe: the next run builds the tables and writes it again.
+- If the file can't be opened, or the folder can't be written to, the static constructor throws, and so does every use of the tables (`TypeInitializationException`).
+
+What was tried, as standalone code outside the static constructor (median of 10 fresh processes, ms):
+
+| | JIT | Native AOT | |
+|---|---|---|---|
+| Build everything | 588 | 582 | |
+| Load all four tables from a binary file (185 KB) | 0.3 | 0.2 | **Kept**: the fastest and the least code |
+| Load all four tables from a CSV file (423 KB) | 10.4 | 2.1 | Slower, and a bigger file |
+| Load only the row offsets (26 KB), check that they fit the keys, compute the rest | 16.8 | 4.6 | Can't load tables that don't match the code, but it's more code and slower |
 
 #### How `RANK_KEYS` were found
 
@@ -706,9 +729,14 @@ What the measurements say:
 API changes:
 - **`IAgent.WitnessShowdown(board, shownHands)`** now also gets the 5-card board, so an agent that folded, or stopped being asked to act because of all-ins, still sees the whole board. Every agent has to add the parameter. `HumanPlayer` prints the board before the hands.
 - The agent contract shows the `pot` parameter that `Play` gained on 2026-11-11: every chip put in so far this hand, blinds included, before this action.
+- **`Game.BuildTables()`** builds `EvalHandRank`'s tables now instead of on first use, so the 0.6 s doesn't land in the first hand of training or in a timed loop. It runs `RankTables`' static constructor with `RuntimeHelpers.RunClassConstructor`, which always runs it. Reading a table and dropping the result only does so because `RankTables` declares a static constructor. `DotnetBench` uses it instead of `Game.HandKeyMask(0)`.
+
+Performance:
+- **Tables file**: `EvalHandRank`'s tables are ready in about 1 ms instead of 0.6 s from the second run on (0.2 ms under Native AOT, and 1.3 ms instead of 1.5 s in a Debug build). The first run saves them to `RankTables.bin` next to the executable, and later runs load that file. Delete it after changing `RankTables` or `EvalHandValue`. See [Tables file](#tables-file).
 
 Tests:
 - `TestAgent.Play` takes `pot`, so the tests compile again. The showdown tests check the board, including for a player who has been all-in since the blinds.
+- `RankTables_ShouldBeTheSame_InUseBuiltAndInTheFile`: the tables in use, a fresh build, the file, and the tables loaded from it all hold the same bytes.
 
 Cost, against the previous Arena in the same process (best of 3 processes, 2 runs, JIT and Native AOT): nothing above the noise. Heads-up it's within 4 ns, and at 6–9 players with always-call agents within 5 ns, where two identical copies of the previous Arena differ by up to 11 ns. Mixed agents at 6–9 players vary too much to tell: up to 34 ns between the identical copies. Hands still allocate 0 bytes, and 1.28M seeded hands replay identically, with every agent shown the board the history records.
 

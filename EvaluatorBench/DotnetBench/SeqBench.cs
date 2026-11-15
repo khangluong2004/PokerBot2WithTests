@@ -50,7 +50,7 @@ public static class SeqBench
 
     public static void Run(string boardsPath)
     {
-        Game.HandKeyMask(0); // build EvalHandRank's tables
+        Game.BuildTables();
         var boards = LoadBoards(boardsPath);
         var cactusKev = new int[52];
         for (int card = 0; card < 52; card++)

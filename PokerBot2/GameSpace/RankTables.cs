@@ -1,13 +1,16 @@
 ﻿using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 
 namespace PokerBot2.GameSpace
 {
-    // Lookup tables for Game.EvalHandRank, built once (on first use, about 0.6 s) from Game.EvalHandValue, so the two
-    // evaluators always order hands the same way. About 180 KB (Ranks 138 KB, RowOffsets 25 KB, Flush 16 KB), small
-    // enough to stay in the L2 cache while nothing else pushes it out.
+    // Lookup tables for Game.EvalHandRank, built from Game.EvalHandValue, so the two evaluators always order hands
+    // the same way. About 180 KB (Ranks 138 KB, RowOffsets 25 KB, Flush 16 KB), small enough to stay in the L2
+    // cache while nothing else pushes it out.
+    // The build takes about 0.6 s, so the first run saves the tables in a file next to the executable, and later
+    // runs load that file instead (see TABLES_FILE).
     internal static class RankTables
     {
         // The rank sums of all multisets of 7 ranks are different, and with these keys Build below packs the rows
@@ -38,9 +41,46 @@ namespace PokerBot2.GameSpace
             return Ranks[(int)rankKey + RowOffsets[rankKey >> ROW_SHIFT]];
         }
 
+        // The four tables as raw bytes, one after the other, in the executable's folder (185 KB). Nothing checks
+        // that the file matches the code: delete it after changing this class or Game.EvalHandValue, or the old
+        // tables stay in use
+        const string TABLES_FILE = "RankTables.bin";
+
         static RankTables()
         {
-            (RowOffsets, Ranks) = Build();
+            string path = Path.Combine(AppContext.BaseDirectory, TABLES_FILE);
+            if (File.Exists(path))
+            {
+                (RowOffsets, Ranks) = Load(path);
+            }
+            else
+            {
+                (RowOffsets, Ranks) = Build();
+                Save(path);
+            }
+        }
+
+        // Fills CardKeyMasks and Flush from the file and returns the perfect hash. Ranks is whatever follows the
+        // other three tables
+        private static (int[] rowOffsets, ushort[] ranks) Load(string path)
+        {
+            using var file = File.OpenRead(path);
+            file.ReadExactly(MemoryMarshal.AsBytes(CardKeyMasks.AsSpan()));
+            file.ReadExactly(MemoryMarshal.AsBytes(Flush.AsSpan()));
+            var rowOffsets = new int[(MAX_RANK_KEY >> ROW_SHIFT) + 1];
+            file.ReadExactly(MemoryMarshal.AsBytes(rowOffsets.AsSpan()));
+            var ranks = new ushort[(file.Length - file.Position) / sizeof(ushort)];
+            file.ReadExactly(MemoryMarshal.AsBytes(ranks.AsSpan()));
+            return (rowOffsets, ranks);
+        }
+
+        private static void Save(string path)
+        {
+            using var file = File.Create(path);
+            file.Write(MemoryMarshal.AsBytes(CardKeyMasks.AsSpan()));
+            file.Write(MemoryMarshal.AsBytes(Flush.AsSpan()));
+            file.Write(MemoryMarshal.AsBytes(RowOffsets.AsSpan()));
+            file.Write(MemoryMarshal.AsBytes(Ranks.AsSpan()));
         }
 
         // Fills the card, suit and flush tables and returns the perfect hash. Compiled optimized from the start: a static

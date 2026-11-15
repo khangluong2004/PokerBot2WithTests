@@ -85,9 +85,8 @@ void Generate(int numHands)
 
 void Bench()
 {
-    // First use builds PokerBot2's tables (static constructor)
     var build = Stopwatch.StartNew();
-    Game.HandKeyMask(0);
+    Game.BuildTables();
     Console.WriteLine($"PokerBot2 EvalHandRank tables built in {build.Elapsed.TotalMilliseconds:F0} ms");
     byte[] hands = File.ReadAllBytes(handsPath);
     int numHands = hands.Length / 7;
