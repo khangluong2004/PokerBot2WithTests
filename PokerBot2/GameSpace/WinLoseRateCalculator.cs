@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 
@@ -19,13 +20,13 @@ namespace PokerBot2.GameSpace
         {
             Debug.Assert(board.Length == 5, "Board must have exactly 5 cards");
             board.Sort();
-            return (board[0] + board[1] << 6 + board[2] << 12 + board[3] << 18 + board[4] << 24);
+            return (board[0] + (board[1] << 6) + (board[2] << 12) + (board[3] << 18) + (board[4] << 24));
         }
 
         public static (double, double) GetWinLoseRateHeadup(Span<int> board, int lowCard, int highCard)
         {
             Debug.Assert(board.Length == 5, "Board must have exactly 5 cards");
-            return winLoseRateByBoardByHand[ToBoardMask(board)][PerBoardHandKey(lowCard, highCard)];
+            return GetWinLoseRateHeadup(ToBoardMask(board), lowCard, highCard);
         }
 
         // Find the win-rate of (card1, card2) against 1 opponent, on a 5-card board
@@ -39,10 +40,10 @@ namespace PokerBot2.GameSpace
         // boardKeyMask is the key used to retrieve the ranks.
         internal static void BuildWinLoseRateByBoardByHand(int numCard, int lastCard,
             int boardMask,
-            int boardIndexMask, Vector128<ulong> boardKeyMask,
+            ulong boardIndexMask, Vector128<ulong> boardKeyMask,
             Dictionary<int, List<(double, double)>> winLoseRateByBoardByHand)
         {
-            if (numCard == 6)
+            if (numCard == 5)
             {
                 winLoseRateByBoardByHand[boardMask] = BuildWinLoseRateHeadupPerBoard(boardIndexMask, boardKeyMask);
                 return;
@@ -54,13 +55,13 @@ namespace PokerBot2.GameSpace
 
                 // Move down
                 boardMask |= (nextCard << (6 * numCard));
-                boardIndexMask |= 1 << nextCard;
+                boardIndexMask |= 1UL << nextCard;
                 boardKeyMask += nextCardKey;
                 BuildWinLoseRateByBoardByHand(numCard + 1, nextCard, boardMask, boardIndexMask, boardKeyMask, winLoseRateByBoardByHand);
 
                 // Backtrack
                 boardMask &= ~(nextCard << (6 * numCard));
-                boardIndexMask &= ~(1 << nextCard);
+                boardIndexMask &= ~(1UL << nextCard);
                 boardKeyMask -= nextCardKey;
             }
         }
@@ -69,15 +70,16 @@ namespace PokerBot2.GameSpace
         const int NUM_HANDS_PER_BOARD = 1081; // 47C2 = 1081
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static int PerBoardHandKey(int lowCard, int highCard) => 51 * lowCard + highCard;
-        internal static List<(double, double)> BuildWinLoseRateHeadupPerBoard(int boardIndexMask, Vector128<ulong> boardKeyMask)
+        internal static List<(double, double)> BuildWinLoseRateHeadupPerBoard(ulong boardIndexMask, Vector128<ulong> boardKeyMask)
         {
+            Debug.Assert(BitOperations.PopCount(boardIndexMask) == 5, "Board needs to have exact 5 card");
             List<int> allHandValues = new List<int>(NUM_HANDS_PER_BOARD); 
             Dictionary<int, (int, int)> handValueToIndex = new (NUM_HANDS_PER_BOARD);
             Vector128<ulong> handKeyMask;
-
+            
             for (int lowCard=0; lowCard < 51; lowCard++)
             {
-                if ((boardIndexMask & (1 << lowCard)) > 0)
+                if ((boardIndexMask & (1UL << lowCard)) != 0)
                 {
                     continue;
                 }
@@ -86,11 +88,10 @@ namespace PokerBot2.GameSpace
 
                 for (int highCard=lowCard+1; highCard < 52; highCard++)
                 {
-                    if ((boardIndexMask & (1 << highCard)) > 0)
+                    if ((boardIndexMask & (1UL << highCard)) != 0)
                     {
                         continue;
                     }
-
                     allHandValues.Add(Game.EvalHandRank(handKeyMask + Game.HandKeyMask(highCard)));
                 }
             }
@@ -104,15 +105,15 @@ namespace PokerBot2.GameSpace
                 do
                 {
                     index++;
-                } while (allHandValues[index] == allHandValues[index - 1]);
+                } while (index < allHandValues.Count && allHandValues[index] == allHandValues[index - 1]);
 
                 handValueToIndex[allHandValues[start]] = (start, index);
             }
 
-            List<(double, double)> winLoseRatePerHand = new(2601); // 51 * 51 = 2601, due to ordered card
+            List<(double, double)> winLoseRatePerHand = [.. new (double, double)[2602]]; // 51 * 51 + 1 = 2602, due to ordered card
             for (int lowCard = 0; lowCard < 51; lowCard++)
             {
-                if ((boardIndexMask & (1 << lowCard)) > 0)
+                if ((boardIndexMask & (1UL << lowCard)) != 0)
                 {
                     continue;
                 }
@@ -121,7 +122,7 @@ namespace PokerBot2.GameSpace
 
                 for (int highCard = lowCard + 1; highCard < 52; highCard++)
                 {
-                    if ((boardIndexMask & (1 << highCard)) > 0)
+                    if ((boardIndexMask & (1UL << highCard)) != 0)
                     {
                         continue;
                     }
