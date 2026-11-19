@@ -513,6 +513,13 @@ namespace PokerBot2.GameSpace
             return RankTables.CardKeyMasks[card];
         }
 
+        // To create the key mask for empty hand (init for flush detection)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector128<ulong> EmptyHandKeyMask()
+        {
+            return Vector128.Create(EMPTY_HAND_KEY, 0UL);
+        }
+
         // Key and mask of the cards, starting from the empty hand. With no cards, the empty hand to add cards to
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static Vector128<ulong> HandKeyMask(ReadOnlySpan<int> cards)
