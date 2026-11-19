@@ -70,6 +70,18 @@ namespace PokerBot2.GameSpace
         const int NUM_HANDS_PER_BOARD = 1081; // 47C2 = 1081
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static int PerBoardHandKey(int lowCard, int highCard) => 51 * lowCard + highCard;
+        private static string BoardIndexMaskToString(ulong boardIndexMask)
+        {
+            string result = "";
+            for (int i = 0; i < 52; i++)
+            {
+                if ((boardIndexMask & (1UL << i)) != 0)
+                {
+                    result += $"{Game.CardToString(i)}, ";
+                }
+            }
+            return result;
+        }
         internal static List<(double, double)> BuildWinLoseRateHeadupPerBoard(ulong boardIndexMask, Vector128<ulong> boardKeyMask)
         {
             Debug.Assert(BitOperations.PopCount(boardIndexMask) == 5, "Board needs to have exact 5 card");
@@ -129,7 +141,8 @@ namespace PokerBot2.GameSpace
 
                     var handRank = Game.EvalHandRank(handKeyMask + Game.HandKeyMask(highCard));
                     var (startCount, endCount) = handValueToIndex[handRank];
-                    winLoseRatePerHand[PerBoardHandKey(lowCard, highCard)] = (startCount/allHandValues.Count, (allHandValues.Count - endCount)/allHandValues.Count);
+                    Logger.DebugOnlyConsoleLog($"Board: {BoardIndexMaskToString(boardIndexMask)} Hand: {Game.CardToString(lowCard)}, {Game.CardToString(highCard)}, WinRate: {startCount * 1.0 / allHandValues.Count}, LoseRate: {(allHandValues.Count - endCount) * 1.0 / allHandValues.Count}");
+                    winLoseRatePerHand[PerBoardHandKey(lowCard, highCard)] = (startCount * 1.0/allHandValues.Count, (allHandValues.Count - endCount) * 1.0/allHandValues.Count);
                 }
             }
 
